@@ -24,38 +24,41 @@ static Expression evaluate(Expression &&e) {
             auto [head, statics, dynamics, spans] = std::move(ce).decompose();
 
             if (head == "DefineView"_) {
-              if (dynamics.size() != 2) {
+              if (dynamics.size() != 2)
                 return Expression(false); // DefineView requires exactly 2 arguments: a symbol for
                                           // the view name and an expression for the view definition
-              }
-              if (auto *name = std::get_if<Symbol>(&dynamics[0])) {
-                viewRegistry[name->getName()] = std::move(dynamics[1]);
-                return Expression(true);
-              }
-              return Expression(false); // DefineView requires a symbol for the view name
+
+              auto *name = std::get_if<Symbol>(&dynamics[0]);
+              if (!name)
+                return Expression(false); // DefineView requires a symbol for the view name
+
+              viewRegistry[name->getName()] = std::move(dynamics[1]);
+              return Expression(true);
             }
 
             if (head == "QueryView"_) {
-              if (dynamics.size() != 1) {
+              if (dynamics.size() != 1)
                 throw std::runtime_error("QueryView requires exactly 1 symbol argument");
-              }
-              if (auto *name = std::get_if<Symbol>(&dynamics[0])) {
-                auto viewName = name->getName();
-                auto it = viewRegistry.find(viewName);
-                if (it != viewRegistry.end()) {
-                  if (evaluationStack.count(viewName)) {
-                    throw std::runtime_error("Circular view dependency detected: " + viewName);
-                  }
-                  evaluationStack.insert(viewName);
-                  struct EvaluationGuard { // RAII guard for evaluation stack cleanup
-                    std::string viewName;
-                    ~EvaluationGuard() { evaluationStack.erase(viewName); }
-                  } guard{viewName};
-                  return evaluate(it->second.clone(CloneReason::EVALUATE_CONST_EXPRESSION));
-                }
+
+              auto *name = std::get_if<Symbol>(&dynamics[0]);
+              if (!name)
+                throw std::runtime_error("QueryView argument must be a symbol");
+
+              auto viewName = name->getName();
+              auto it = viewRegistry.find(viewName);
+              if (it == viewRegistry.end())
                 throw std::runtime_error("View not found: " + name->getName());
-              }
-              throw std::runtime_error("QueryView argument must be a symbol");
+
+              if (evaluationStack.count(viewName))
+                throw std::runtime_error("Circular view dependency detected: " + viewName);
+
+              evaluationStack.insert(viewName);
+              struct EvaluationGuard { // RAII guard for evaluation stack cleanup
+                std::string viewName;
+                ~EvaluationGuard() { evaluationStack.erase(viewName); }
+              } guard{viewName};
+
+              return evaluate(it->second.clone(CloneReason::EVALUATE_CONST_EXPRESSION));
             }
 
             for (auto &arg : dynamics) {
