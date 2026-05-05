@@ -23,6 +23,9 @@ static Expression evaluate(Expression &&e) {
           [](ComplexExpression &&ce) -> Expression {
             auto [head, statics, dynamics, spans] = std::move(ce).decompose();
 
+            // TODO: validate view expression at define time to catch:
+            //   - circular dependencies (A -> B -> A)
+            //   - dropping a view that is later referenced in the same expression
             if (head == "DefineView"_) {
               if (dynamics.size() != 2)
                 return Expression(false); // DefineView requires exactly 2 arguments: a symbol for
@@ -59,6 +62,22 @@ static Expression evaluate(Expression &&e) {
               } guard{viewName};
 
               return evaluate(it->second.clone(CloneReason::EVALUATE_CONST_EXPRESSION));
+            }
+
+            if (head == "DropView"_) {
+              if (dynamics.size() != 1)
+                throw std::runtime_error("DropView requires exactly 1 symbol argument");
+
+              auto *name = std::get_if<Symbol>(&dynamics[0]);
+              if (!name)
+                throw std::runtime_error("DropView argument must be a symbol");
+
+              auto viewName = name->getName();
+              if (evaluationStack.count(viewName))
+                throw std::runtime_error("Cannot drop view currently being evaluated: " + viewName);
+
+              viewRegistry.erase(viewName);
+              return Expression(true);
             }
 
             for (auto &arg : dynamics) {

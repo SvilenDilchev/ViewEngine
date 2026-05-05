@@ -179,3 +179,54 @@
           (boss-eval (QueryView CLEAN_A))
           (boss-eval (DefineView CLEAN_A (Table (A 1 2 3))))
           (boss-eval (QueryView CLEAN_A)))))
+
+(test-group "DropView"
+
+  (test "DropView returns true on success"
+        #t
+        (begin
+          (boss-eval (DefineView DROP1 (Table (A 1 2 3))))
+          (boss-eval (DropView DROP1))))
+
+  (test "DropView on non-existent view returns true"
+        #t
+        (boss-eval (DropView NONEXISTENT_DROP)))
+
+  (test "DropView removes view from registry"
+        '(ErrorWhenEvaluatingExpression (||) "View not found: DROP2")
+        (begin
+          (boss-eval (DefineView DROP2 (Table (A 1 2 3))))
+          (boss-eval (DropView DROP2))
+          (boss-eval (QueryView DROP2))))
+
+  (test "DropView with no arguments throws"
+        '(ErrorWhenEvaluatingExpression (||) "DropView requires exactly 1 symbol argument")
+        (boss-eval (DropView)))
+
+  (test "DropView with too many arguments throws"
+        '(ErrorWhenEvaluatingExpression (||) "DropView requires exactly 1 symbol argument")
+        (begin
+          (boss-eval (DefineView DROP3 (Table (A 1 2 3))))
+          (boss-eval (DefineView DROP4 (Table (A 1 2 3))))
+          (boss-eval (DropView DROP3 DROP4))))
+
+  (test "DropView with integer argument throws"
+        '(ErrorWhenEvaluatingExpression (||) "DropView argument must be a symbol")
+        (boss-eval (DropView 123)))
+
+  (test "DropView with expression argument throws"
+        '(ErrorWhenEvaluatingExpression (||) "DropView argument must be a symbol")
+        (boss-eval (DropView (Table (A 1 2 3)))))
+
+  (test "DropView on view currently being evaluated throws"
+        '(ErrorWhenEvaluatingExpression (||) "Cannot drop view currently being evaluated: DROP5")
+        (begin
+          (boss-eval (DefineView DROP5 (Filter (DropView DROP5) (Greater A 1))))
+          (boss-eval (QueryView DROP5))))
+          
+  (test "DropView succeeds after previously failing mid-evaluation"
+        #t
+        (begin
+          (boss-eval (DefineView DROP6 (Filter (DropView DROP6) (Greater A 1))))
+          (boss-eval (QueryView DROP6)) ;; throws, but stack must be cleaned up
+          (boss-eval (DropView DROP6)))))
