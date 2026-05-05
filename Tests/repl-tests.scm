@@ -230,3 +230,84 @@
           (boss-eval (DefineView DROP6 (Filter (DropView DROP6) (Greater A 1))))
           (boss-eval (QueryView DROP6)) ;; throws, but stack must be cleaned up
           (boss-eval (DropView DROP6)))))
+
+(test-group "ClearViews"
+
+  (test "ClearViews returns true"
+        #t
+        (boss-eval (ClearViews)))
+
+  (test "ClearViews with arguments throws"
+        '(ErrorWhenEvaluatingExpression (||) "ClearViews does not take any arguments")
+        (boss-eval (ClearViews EXTRA)))
+
+  (test "ClearViews removes all views"
+        '(ErrorWhenEvaluatingExpression (||) "View not found: CLEAR1")
+        (begin
+          (boss-eval (DefineView CLEAR1 (Table (A 1 2 3))))
+          (boss-eval (DefineView CLEAR2 (Table (B 4 5 6))))
+          (boss-eval (ClearViews))
+          (boss-eval (QueryView CLEAR1))))
+
+  (test "ClearViews while view is being evaluated throws"
+        '(ErrorWhenEvaluatingExpression (||) "Cannot clear views while 1 view(s) are being evaluated, e.g.: CLEAR3")
+        (begin
+          (boss-eval (DefineView CLEAR3 (Filter (ClearViews) (Greater A 1))))
+          (boss-eval (QueryView CLEAR3))))
+
+  (test "ClearViews is idempotent on empty registry"
+        #t
+        (begin
+          (boss-eval (ClearViews))
+          (boss-eval (ClearViews)))))
+
+(test-group "ListViews"
+
+  (test "ListViews with arguments throws"
+        '(ErrorWhenEvaluatingExpression (||) "ListViews does not take any arguments")
+        (boss-eval (ListViews EXTRA)))
+
+  (test "ListViews on empty registry returns empty ViewList"
+        '(ViewList (Name) (Definition))
+        (begin
+          (boss-eval (ClearViews))
+          (boss-eval (ListViews))))
+
+  (test "ListViews returns single view"
+        '(ViewList (Name LIST1) (Definition (Table (A 1 2 3))))
+        (begin
+          (boss-eval (ClearViews))
+          (boss-eval (DefineView LIST1 (Table (A 1 2 3))))
+          (boss-eval (ListViews))))
+
+  (test "ListViews returns multiple views"
+        '(ViewList (Name LIST2 LIST3) (Definition (Table (A 1 2 3)) (Table (B 4 5 6))))
+        (begin
+          (boss-eval (ClearViews))
+          (boss-eval (DefineView LIST2 (Table (A 1 2 3))))
+          (boss-eval (DefineView LIST3 (Table (B 4 5 6))))
+          (boss-eval (ListViews))))
+
+  (test "ListViews reflects overwritten view"
+        '(ViewList (Name LIST4) (Definition (Table (A 99))))
+        (begin
+          (boss-eval (ClearViews))
+          (boss-eval (DefineView LIST4 (Table (A 1 2 3))))
+          (boss-eval (DefineView LIST4 (Table (A 99))))
+          (boss-eval (ListViews))))
+
+  (test "ListViews does not show dropped view"
+        '(ViewList (Name LIST6) (Definition (Table (B 4 5 6))))
+        (begin
+          (boss-eval (ClearViews))
+          (boss-eval (DefineView LIST5 (Table (A 1 2 3))))
+          (boss-eval (DefineView LIST6 (Table (B 4 5 6))))
+          (boss-eval (DropView LIST5))
+          (boss-eval (ListViews))))
+
+  (test "ListViews returns unevaluated expressions"
+        '(ViewList (Name LIST7) (Definition (QueryView LIST7)))
+        (begin
+          (boss-eval (ClearViews))
+          (boss-eval (DefineView LIST7 (QueryView LIST7)))
+          (boss-eval (ListViews)))))

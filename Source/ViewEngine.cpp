@@ -26,6 +26,7 @@ static Expression evaluate(Expression &&e) {
             // TODO: validate view expression at define time to catch:
             //   - circular dependencies (A -> B -> A)
             //   - dropping a view that is later referenced in the same expression
+            //   - calls to ClearViews
             if (head == "DefineView"_) {
               if (dynamics.size() != 2)
                 return Expression(false); // DefineView requires exactly 2 arguments: a symbol for
@@ -78,6 +79,41 @@ static Expression evaluate(Expression &&e) {
 
               viewRegistry.erase(viewName);
               return Expression(true);
+            }
+
+            if (head == "ClearViews"_) {
+              if (!dynamics.empty())
+                throw std::runtime_error("ClearViews does not take any arguments");
+
+              if (!evaluationStack.empty())
+                throw std::runtime_error(
+                    "Cannot clear views while " + std::to_string(evaluationStack.size()) +
+                    " view(s) are being evaluated, e.g.: " + *evaluationStack.begin());
+
+              viewRegistry.clear();
+              return Expression(true);
+            }
+
+            if (head == "ListViews"_) {
+              if (!dynamics.empty())
+                throw std::runtime_error("ListViews does not take any arguments");
+
+              std::vector<std::string> sortedNames; // Sort view names for deterministic output
+              for (const auto &[name, _] : viewRegistry)
+                sortedNames.emplace_back(name);
+              std::sort(sortedNames.begin(), sortedNames.end());
+
+              boss::ExpressionArguments nameArgs;
+              boss::ExpressionArguments defArgs;
+              for (const auto &name : sortedNames) {
+                nameArgs.emplace_back(Symbol(name));
+                defArgs.emplace_back(viewRegistry.at(name).clone(CloneReason::EXPRESSION_WRAPPING));
+              }
+
+              boss::ExpressionArguments columns;
+              columns.emplace_back(ComplexExpression("Name"_, {}, std::move(nameArgs), {}));
+              columns.emplace_back(ComplexExpression("Definition"_, {}, std::move(defArgs), {}));
+              return Expression(ComplexExpression("ViewList"_, {}, std::move(columns), {}));
             }
 
             for (auto &arg : dynamics) {
