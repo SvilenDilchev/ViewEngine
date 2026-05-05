@@ -5,6 +5,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 using boss::utilities::operator""_;
 using boss::ComplexExpression;
@@ -13,8 +14,8 @@ using boss::Symbol;
 using boss::Expression;
 using boss::expressions::CloneReason;
 
-// In memory register of Views
-static std::unordered_map<std::string, Expression> viewRegistry;
+static std::unordered_map<std::string, Expression> viewRegistry; // In memory register of Views
+static std::unordered_set<std::string> evaluationStack;          // To detect circular dependencies
 
 static Expression evaluate(Expression &&e) {
   return std::visit(
@@ -39,8 +40,17 @@ static Expression evaluate(Expression &&e) {
                 throw std::runtime_error("QueryView requires exactly 1 symbol argument");
               }
               if (auto *name = std::get_if<Symbol>(&dynamics[0])) {
-                auto it = viewRegistry.find(name->getName());
+                auto viewName = name->getName();
+                auto it = viewRegistry.find(viewName);
                 if (it != viewRegistry.end()) {
+                  if (evaluationStack.count(viewName)) {
+                    throw std::runtime_error("Circular view dependency detected: " + viewName);
+                  }
+                  evaluationStack.insert(viewName);
+                  struct EvaluationGuard { // RAII guard for evaluation stack cleanup
+                    std::string viewName;
+                    ~EvaluationGuard() { evaluationStack.erase(viewName); }
+                  } guard{viewName};
                   return evaluate(it->second.clone(CloneReason::EVALUATE_CONST_EXPRESSION));
                 }
                 throw std::runtime_error("View not found: " + name->getName());

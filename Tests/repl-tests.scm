@@ -150,4 +150,36 @@
           (boss-eval (DefineView BASE3 (Table (A 1 2 3) (B 4 5 6))))
           (boss-eval (Project (QueryView BASE3) A))))
 
+  ;; --- Circular view detection ---
+
+  (test "Circular view: self-reference throws"
+        '(ErrorWhenEvaluatingExpression (||) "Circular view dependency detected: SELF")
+        (begin
+          (boss-eval (DefineView SELF (QueryView SELF)))
+          (boss-eval (QueryView SELF))))
+
+  (test "Circular view: direct cycle A -> B -> A throws"
+        '(ErrorWhenEvaluatingExpression (||) "Circular view dependency detected: CYCA")
+        (begin
+          (boss-eval (DefineView CYCA (QueryView CYCB)))
+          (boss-eval (DefineView CYCB (QueryView CYCA)))
+          (boss-eval (QueryView CYCA))))
+
+  (test "Circular view: three-step cycle A -> B -> C -> A throws"
+        '(ErrorWhenEvaluatingExpression (||) "Circular view dependency detected: TRIIA")
+        (begin
+          (boss-eval (DefineView TRIIA (QueryView TRIIB)))
+          (boss-eval (DefineView TRIIB (QueryView TRIIC)))
+          (boss-eval (DefineView TRIIC (QueryView TRIIA)))
+          (boss-eval (QueryView TRIIA))))
+
+  (test "Circular view: stack is clean after cycle, same view queryable again"
+        '(Table (A 1 2 3))
+        (begin
+          (boss-eval (DefineView CLEAN_A (QueryView CLEAN_B)))
+          (boss-eval (DefineView CLEAN_B (QueryView CLEAN_A)))
+          (boss-eval (QueryView CLEAN_A))
+          (boss-eval (DefineView CLEAN_A (Table (A 1 2 3))))
+          (boss-eval (QueryView CLEAN_A))))
+
 )
