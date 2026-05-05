@@ -3,6 +3,7 @@
 #include <ExpressionUtilities.hpp>
 #include <Utilities.hpp>
 
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -98,16 +99,18 @@ static Expression evaluate(Expression &&e) {
               if (!dynamics.empty())
                 throw std::runtime_error("ListViews does not take any arguments");
 
-              std::vector<std::string> sortedNames; // Sort view names for deterministic output
-              for (const auto &[name, _] : viewRegistry)
-                sortedNames.emplace_back(name);
-              std::sort(sortedNames.begin(), sortedNames.end());
+              // Sort views for deterministic output
+              std::vector<std::pair<std::string, const Expression *>> sortedViews;
+              for (const auto &[name, expr] : viewRegistry)
+                sortedViews.emplace_back(name, &expr);
+              std::sort(sortedViews.begin(), sortedViews.end(),
+                        [](const auto &a, const auto &b) { return a.first < b.first; });
 
               boss::ExpressionArguments nameArgs;
               boss::ExpressionArguments defArgs;
-              for (const auto &name : sortedNames) {
+              for (const auto &[name, definition] : sortedViews) {
                 nameArgs.emplace_back(Symbol(name));
-                defArgs.emplace_back(viewRegistry.at(name).clone(CloneReason::EXPRESSION_WRAPPING));
+                defArgs.emplace_back(definition->clone(CloneReason::EXPRESSION_WRAPPING));
               }
 
               boss::ExpressionArguments columns;
