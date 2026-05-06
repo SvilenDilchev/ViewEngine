@@ -5,6 +5,7 @@
 (boss-eval (SetDefaultEnginePipeline
     "/mnt/apps/lazy-loading/ViewEngine/build/libViewEngine.so"))
 
+
 (test-group "DefineView"
 
   (test "DefineView returns true on success"
@@ -16,6 +17,7 @@
         (begin
           (boss-eval (DefineView OVERWRITE (Table (A 1 2))))
           (boss-eval (DefineView OVERWRITE (Table (A 10 20)))))))
+
 
 (test-group "DefineView failures"
 
@@ -43,6 +45,7 @@
         #f
         (boss-eval (DefineView (Table (A 1)) (Table (A 1 2 3))))))
 
+
 (test-group "QueryView"
 
   (test "QueryView resolves to stored expression"
@@ -64,6 +67,7 @@
           (boss-eval (DefineView REPEATED (Table (A 1 2 3))))
           (boss-eval (QueryView REPEATED))
           (boss-eval (QueryView REPEATED)))))
+
 
 (test-group "QueryView errors"
 
@@ -90,6 +94,7 @@
         '(ErrorWhenEvaluatingExpression (||) "QueryView argument must be a symbol")
         (boss-eval (QueryView (Table (A 1 2 3))))))
 
+
 (test-group "Nested views"
 
   (test "QueryView inside stored expression gets resolved"
@@ -106,6 +111,7 @@
           (boss-eval (DefineView LEVEL2 (Filter (QueryView LEVEL1) (Greater A 1))))
           (boss-eval (DefineView LEVEL3 (GroupBy (QueryView LEVEL2) (Sum A))))
           (boss-eval (QueryView LEVEL3)))))
+
 
 (test-group "Nested DefineView"
 
@@ -126,7 +132,15 @@
           (boss-eval (DefineView OUTER4
               (Filter (DefineView INNER3 (Table (A 1 2 3))) (Greater A 1))))
           (boss-eval (QueryView OUTER4))
-          (boss-eval (QueryView INNER3)))))
+          (boss-eval (QueryView INNER3))))
+          
+  ;; OUTER5 contains a nested DefineView whose body references OUTER5 itself via QueryView.
+  ;; collectDeps finds QueryView OUTER5 inside the nested DefineView body and blocks at define time.
+  (test "Nested DefineView referencing outer view blocked at define time"
+        #f
+        (boss-eval (DefineView OUTER5
+            (Filter (DefineView INNER5 (QueryView OUTER5)) (Greater A 1))))))
+
 
 (test-group "QueryView inside expressions"
 
@@ -148,37 +162,41 @@
           (boss-eval (DefineView BASE3 (Table (A 1 2 3) (B 4 5 6))))
           (boss-eval (Project (QueryView BASE3) A)))))
 
+
 (test-group "Circular view detection"
 
-  (test "Self-reference throws"
-        '(ErrorWhenEvaluatingExpression (||) "Circular view dependency detected: SELF")
-        (begin
-          (boss-eval (DefineView SELF (QueryView SELF)))
-          (boss-eval (QueryView SELF))))
+  (test "Self-reference blocked at define time"
+        #f
+        (boss-eval (DefineView SELF (QueryView SELF))))
 
-  (test "Direct cycle A -> B -> A throws"
-        '(ErrorWhenEvaluatingExpression (||) "Circular view dependency detected: CYCA")
+  (test "Direct cycle blocked - second define returns false"
+        #f
         (begin
           (boss-eval (DefineView CYCA (QueryView CYCB)))
-          (boss-eval (DefineView CYCB (QueryView CYCA)))
-          (boss-eval (QueryView CYCA))))
+          (boss-eval (DefineView CYCB (QueryView CYCA)))))
 
-  (test "Three-step cycle A -> B -> C -> A throws"
-        '(ErrorWhenEvaluatingExpression (||) "Circular view dependency detected: TRIIA")
+  (test "Three-step cycle blocked - third define returns false"
+        #f
         (begin
           (boss-eval (DefineView TRIIA (QueryView TRIIB)))
           (boss-eval (DefineView TRIIB (QueryView TRIIC)))
-          (boss-eval (DefineView TRIIC (QueryView TRIIA)))
-          (boss-eval (QueryView TRIIA))))
+          (boss-eval (DefineView TRIIC (QueryView TRIIA)))))
 
-  (test "Stack is clean after cycle, same view queryable again"
+  (test "Blocked define leaves registry unchanged"
+        '(ErrorWhenEvaluatingExpression (||) "View not found: CYCB2")
+        (begin
+          (boss-eval (DefineView CYCA2 (QueryView CYCB2)))
+          (boss-eval (DefineView CYCB2 (QueryView CYCA2))) ;; blocked
+          (boss-eval (QueryView CYCB2))))                  ;; CYCB2 was never stored
+
+  (test "Registry still usable after blocked cycle define"
         '(Table (A 1 2 3))
         (begin
           (boss-eval (DefineView CLEAN_A (QueryView CLEAN_B)))
-          (boss-eval (DefineView CLEAN_B (QueryView CLEAN_A)))
-          (boss-eval (QueryView CLEAN_A))
-          (boss-eval (DefineView CLEAN_A (Table (A 1 2 3))))
+          (boss-eval (DefineView CLEAN_B (QueryView CLEAN_A))) ;; blocked
+          (boss-eval (DefineView CLEAN_A (Table (A 1 2 3))))   ;; redefine cleanly
           (boss-eval (QueryView CLEAN_A)))))
+
 
 (test-group "DropView"
 
@@ -229,7 +247,31 @@
         (begin
           (boss-eval (DefineView DROP6 (Filter (DropView DROP6) (Greater A 1))))
           (boss-eval (QueryView DROP6)) ;; throws, but stack must be cleaned up
-          (boss-eval (DropView DROP6)))))
+          (boss-eval (DropView DROP6))))
+
+  (test "DropView blocked if another view depends on it"
+        '(ErrorWhenEvaluatingExpression (||) "Cannot drop view DEP_BASE: DEP_CHILD depends on it")
+        (begin
+          (boss-eval (DefineView DEP_BASE (Table (A 1 2 3))))
+          (boss-eval (DefineView DEP_CHILD (QueryView DEP_BASE)))
+          (boss-eval (DropView DEP_BASE))))
+
+  (test "DropView succeeds after dependent is dropped first"
+        #t
+        (begin
+          (boss-eval (DefineView DEP_BASE2 (Table (A 1 2 3))))
+          (boss-eval (DefineView DEP_CHILD2 (QueryView DEP_BASE2)))
+          (boss-eval (DropView DEP_CHILD2))
+          (boss-eval (DropView DEP_BASE2))))
+
+  (test "DropView unblocked after dependent is redefined without dependency"
+        #t
+        (begin
+          (boss-eval (DefineView DEP_BASE3 (Table (A 1 2 3))))
+          (boss-eval (DefineView DEP_CHILD3 (QueryView DEP_BASE3)))
+          (boss-eval (DefineView DEP_CHILD3 (Table (B 4 5 6)))) ;; redefine removes dep
+          (boss-eval (DropView DEP_BASE3)))))
+
 
 (test-group "ClearViews"
 
@@ -260,6 +302,7 @@
         (begin
           (boss-eval (ClearViews))
           (boss-eval (ClearViews)))))
+
 
 (test-group "ListViews"
 
@@ -306,8 +349,8 @@
           (boss-eval (ListViews))))
 
   (test "ListViews returns unevaluated expressions"
-        '(ViewList (Name LIST7) (Definition (QueryView LIST7)))
+        '(ViewList (Name LIST7) (Definition (QueryView SOMEOTHER)))
         (begin
           (boss-eval (ClearViews))
-          (boss-eval (DefineView LIST7 (QueryView LIST7)))
+          (boss-eval (DefineView LIST7 (QueryView SOMEOTHER)))
           (boss-eval (ListViews)))))

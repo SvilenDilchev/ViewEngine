@@ -16,7 +16,50 @@ using boss::Expression;
 using boss::expressions::CloneReason;
 
 static std::unordered_map<std::string, Expression> viewRegistry; // In memory register of Views
-static std::unordered_set<std::string> evaluationStack;          // To detect circular dependencies
+static std::unordered_set<std::string> evaluationStack;          // Guard against runtime cycles
+static std::unordered_map<std::string, std::unordered_set<std::string>>
+    viewDependencies; // Dependency graph used for define time and drop time validation
+
+// Used to build the dependency graph with direct dependencies
+static void collectDeps(const Expression &expr, std::unordered_set<std::string> &deps) {
+  std::visit(boss::utilities::overload(
+                 [&](const ComplexExpression &ce) {
+                   auto const &dynamics = ce.getDynamicArguments();
+                   if (ce.getHead() == "QueryView"_) {
+                     if (!dynamics.empty())
+                       if (auto *sym = std::get_if<Symbol>(&dynamics[0]))
+                         deps.insert(sym->getName());
+
+                     return;
+                   }
+                   for (const auto &arg : dynamics) {
+                     collectDeps(arg, deps);
+                   }
+                 },
+                 [](const auto &) {}),
+             expr);
+}
+
+// DFS traversal to detect cycles in the dependency graph
+static bool hasCycle(const std::string &newView, const std::string &current,
+                     std::unordered_set<std::string> &visited) {
+  if (current == newView)
+    return true;
+
+  if (visited.count(current))
+    return false;
+
+  visited.insert(current);
+  auto it = viewDependencies.find(current);
+  if (it == viewDependencies.end())
+    return false;
+
+  for (const auto &dep : it->second)
+    if (hasCycle(newView, dep, visited))
+      return true;
+
+  return false;
+}
 
 static Expression evaluate(Expression &&e) {
   return std::visit(
@@ -24,10 +67,6 @@ static Expression evaluate(Expression &&e) {
           [](ComplexExpression &&ce) -> Expression {
             auto [head, statics, dynamics, spans] = std::move(ce).decompose();
 
-            // TODO: validate view expression at define time to catch:
-            //   - circular dependencies (A -> B -> A)
-            //   - dropping a view that is later referenced in the same expression
-            //   - calls to ClearViews
             if (head == "DefineView"_) {
               if (dynamics.size() != 2)
                 return Expression(false); // DefineView requires exactly 2 arguments: a symbol for
@@ -37,7 +76,18 @@ static Expression evaluate(Expression &&e) {
               if (!name)
                 return Expression(false); // DefineView requires a symbol for the view name
 
-              viewRegistry[name->getName()] = std::move(dynamics[1]);
+              auto viewName = name->getName();
+              std::unordered_set<std::string> deps;
+              collectDeps(dynamics[1], deps); // Collect direct dependencies for the view
+
+              std::unordered_set<std::string> visited;
+              for (const auto &dep : deps) {
+                if (hasCycle(viewName, dep, visited))
+                  return Expression(false); // Block view definition if it creates a cycle
+              }
+
+              viewDependencies[viewName] = std::move(deps);
+              viewRegistry[viewName] = std::move(dynamics[1]);
               return Expression(true);
             }
 
@@ -78,7 +128,14 @@ static Expression evaluate(Expression &&e) {
               if (evaluationStack.count(viewName))
                 throw std::runtime_error("Cannot drop view currently being evaluated: " + viewName);
 
+              for (const auto &[dependent, deps] : viewDependencies) {
+                if (deps.count(viewName))
+                  throw std::runtime_error("Cannot drop view " + viewName + ": " + dependent +
+                                           " depends on it");
+              }
+
               viewRegistry.erase(viewName);
+              viewDependencies.erase(viewName);
               return Expression(true);
             }
 
@@ -92,6 +149,7 @@ static Expression evaluate(Expression &&e) {
                     " view(s) are being evaluated, e.g.: " + *evaluationStack.begin());
 
               viewRegistry.clear();
+              viewDependencies.clear();
               return Expression(true);
             }
 
