@@ -15,10 +15,13 @@ using boss::Symbol;
 using boss::Expression;
 using boss::expressions::CloneReason;
 
-static std::unordered_map<std::string, Expression> viewRegistry; // In memory register of Views
-static std::unordered_set<std::string> evaluationStack;          // Guard against runtime cycles
-static std::unordered_map<std::string, std::unordered_set<std::string>>
-    viewDependencies; // Dependency graph used for define time and drop time validation
+struct ViewEntry {
+  Expression definition;
+  std::unordered_set<std::string> dependencies;
+};
+
+static std::unordered_map<std::string, ViewEntry> viewRegistry; // In memory register of Views
+static std::unordered_set<std::string> evaluationStack;         // Guard against runtime cycles
 
 struct WalkResult {
   std::unordered_set<std::string> dependencies;
@@ -66,11 +69,11 @@ static bool hasCycle(const std::string &newView, const std::string &current,
     return false;
 
   visited.insert(current);
-  auto it = viewDependencies.find(current);
-  if (it == viewDependencies.end())
+  auto it = viewRegistry.find(current);
+  if (it == viewRegistry.end())
     return false;
 
-  for (const auto &dep : it->second)
+  for (const auto &dep : it->second.dependencies)
     if (hasCycle(newView, dep, visited))
       return true;
 
@@ -110,8 +113,8 @@ static Expression evaluate(Expression &&e) {
                   return Expression(false); // Block if definition creates a cycle
               }
 
-              viewDependencies[viewName] = std::move(result.dependencies);
-              viewRegistry[viewName] = std::move(dynamics[1]);
+              viewRegistry[viewName] =
+                  ViewEntry{std::move(dynamics[1]), std::move(result.dependencies)};
               return Expression(true);
             }
 
@@ -137,7 +140,7 @@ static Expression evaluate(Expression &&e) {
                 ~EvaluationGuard() { evaluationStack.erase(viewName); }
               } guard{viewName};
 
-              return evaluate(it->second.clone(CloneReason::EVALUATE_CONST_EXPRESSION));
+              return evaluate(it->second.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION));
             }
 
             if (head == "DropView"_) {
@@ -152,14 +155,13 @@ static Expression evaluate(Expression &&e) {
               if (evaluationStack.count(viewName))
                 throw std::runtime_error("Cannot drop view currently being evaluated: " + viewName);
 
-              for (const auto &[dependent, deps] : viewDependencies) {
-                if (deps.count(viewName))
+              for (const auto &[dependent, entry] : viewRegistry) {
+                if (entry.dependencies.count(viewName))
                   throw std::runtime_error("Cannot drop view " + viewName + ": " + dependent +
                                            " depends on it");
               }
 
               viewRegistry.erase(viewName);
-              viewDependencies.erase(viewName);
               return Expression(true);
             }
 
@@ -173,7 +175,6 @@ static Expression evaluate(Expression &&e) {
                     " view(s) are being evaluated, e.g.: " + *evaluationStack.begin());
 
               viewRegistry.clear();
-              viewDependencies.clear();
               return Expression(true);
             }
 
@@ -182,7 +183,8 @@ static Expression evaluate(Expression &&e) {
                 throw std::runtime_error("ListViews does not take any arguments");
 
               // Sort views for deterministic output
-              std::vector<std::pair<std::string, const Expression *>> sortedViews;
+              std::vector<std::pair<std::string, const ViewEntry *>> sortedViews;
+              sortedViews.reserve(viewRegistry.size());
               for (const auto &[name, expr] : viewRegistry)
                 sortedViews.emplace_back(name, &expr);
               std::sort(sortedViews.begin(), sortedViews.end(),
@@ -190,9 +192,9 @@ static Expression evaluate(Expression &&e) {
 
               boss::ExpressionArguments nameArgs;
               boss::ExpressionArguments defArgs;
-              for (const auto &[name, definition] : sortedViews) {
+              for (const auto &[name, entry] : sortedViews) {
                 nameArgs.emplace_back(Symbol(name));
-                defArgs.emplace_back(definition->clone(CloneReason::EXPRESSION_WRAPPING));
+                defArgs.emplace_back(entry->definition.clone(CloneReason::EXPRESSION_WRAPPING));
               }
 
               boss::ExpressionArguments columns;
