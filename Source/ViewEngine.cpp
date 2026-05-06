@@ -20,20 +20,36 @@ static std::unordered_set<std::string> evaluationStack;          // Guard agains
 static std::unordered_map<std::string, std::unordered_set<std::string>>
     viewDependencies; // Dependency graph used for define time and drop time validation
 
-// Used to build the dependency graph with direct dependencies
-static void collectDeps(const Expression &expr, std::unordered_set<std::string> &deps) {
+struct WalkResult {
+  std::unordered_set<std::string> dependencies;
+  std::unordered_set<std::string> dropped;
+  bool callsClearViews = false;
+};
+
+// Used to build the dependency graph with direct dependencies and detect calls to ClearViews
+static void walkViews(const Expression &expr, WalkResult &result) {
   std::visit(boss::utilities::overload(
                  [&](const ComplexExpression &ce) {
                    auto const &dynamics = ce.getDynamicArguments();
-                   if (ce.getHead() == "QueryView"_) {
+                   auto head = ce.getHead();
+                   if (head == "QueryView"_) {
                      if (!dynamics.empty())
                        if (auto *sym = std::get_if<Symbol>(&dynamics[0]))
-                         deps.insert(sym->getName());
-
+                         result.dependencies.insert(sym->getName());
+                     return;
+                   }
+                   if (head == "DropView"_) {
+                     if (!dynamics.empty())
+                       if (auto *sym = std::get_if<Symbol>(&dynamics[0]))
+                         result.dropped.insert(sym->getName());
+                     return;
+                   }
+                   if (head == "ClearViews"_) {
+                     result.callsClearViews = true;
                      return;
                    }
                    for (const auto &arg : dynamics) {
-                     collectDeps(arg, deps);
+                     walkViews(arg, result);
                    }
                  },
                  [](const auto &) {}),
@@ -77,16 +93,24 @@ static Expression evaluate(Expression &&e) {
                 return Expression(false); // DefineView requires a symbol for the view name
 
               auto viewName = name->getName();
-              std::unordered_set<std::string> deps;
-              collectDeps(dynamics[1], deps); // Collect direct dependencies for the view
+              WalkResult result;
+              walkViews(dynamics[1], result); // Walk the view expression to collect data for
+                                              // dependency graph construction and validation
+
+              if (result.callsClearViews)
+                return Expression(false); // Block if definition calls ClearViews
 
               std::unordered_set<std::string> visited;
-              for (const auto &dep : deps) {
+              for (const auto &dep : result.dependencies) {
+                if (result.dropped.count(dep))
+                  // Block if definition drops any views it depends on
+                  return Expression(false);
+
                 if (hasCycle(viewName, dep, visited))
-                  return Expression(false); // Block view definition if it creates a cycle
+                  return Expression(false); // Block if definition creates a cycle
               }
 
-              viewDependencies[viewName] = std::move(deps);
+              viewDependencies[viewName] = std::move(result.dependencies);
               viewRegistry[viewName] = std::move(dynamics[1]);
               return Expression(true);
             }

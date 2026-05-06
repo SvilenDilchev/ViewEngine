@@ -43,7 +43,23 @@
 
   (test "DefineView with expression as name returns false"
         #f
-        (boss-eval (DefineView (Table (A 1)) (Table (A 1 2 3))))))
+        (boss-eval (DefineView (Table (A 1)) (Table (A 1 2 3)))))
+
+  (test "DefineView with ClearViews in body returns false"
+        #f
+        (boss-eval (DefineView BAD_CLEAR (Filter (ClearViews) (Greater A 1)))))
+
+  (test "DefineView with DropView then QueryView of same view returns false"
+        #f
+        (boss-eval (DefineView BAD_DROP_QUERY
+            (Filter (DropView SOME_VIEW) (QueryView SOME_VIEW)))))
+
+  (test "DefineView with QueryView then DropView of same view returns false"
+        #f
+        (begin
+          (boss-eval (DefineView QTD_TARGET (Table (A 1 2 3))))
+          (boss-eval (DefineView BAD_QUERY_DROP
+              (Filter (QueryView QTD_TARGET) (DropView QTD_TARGET)))))))
 
 
 (test-group "QueryView"
@@ -270,7 +286,20 @@
           (boss-eval (DefineView DEP_BASE3 (Table (A 1 2 3))))
           (boss-eval (DefineView DEP_CHILD3 (QueryView DEP_BASE3)))
           (boss-eval (DefineView DEP_CHILD3 (Table (B 4 5 6)))) ;; redefine removes dep
-          (boss-eval (DropView DEP_BASE3)))))
+          (boss-eval (DropView DEP_BASE3))))
+
+  (test "QueryView on view with DropView of unrelated view succeeds and drops it"
+        '(Filter (Table (A 1 2 3)) #t)
+        (begin
+          (boss-eval (DefineView DROP_SIDE_DATA (Table (A 1 2 3))))
+          (boss-eval (DefineView DROP_SIDE_UNRELATED (Table (B 4 5 6))))
+          (boss-eval (DefineView DROP_SIDE_VIEW
+              (Filter (QueryView DROP_SIDE_DATA) (DropView DROP_SIDE_UNRELATED))))
+          (boss-eval (QueryView DROP_SIDE_VIEW))))
+
+  (test "Unrelated view is gone after drop side effect"
+        '(ErrorWhenEvaluatingExpression (||) "View not found: DROP_SIDE_UNRELATED")
+        (boss-eval (QueryView DROP_SIDE_UNRELATED))))
 
 
 (test-group "ClearViews"
@@ -291,11 +320,9 @@
           (boss-eval (ClearViews))
           (boss-eval (QueryView CLEAR1))))
 
-  (test "ClearViews while view is being evaluated throws"
-        '(ErrorWhenEvaluatingExpression (||) "Cannot clear views while 1 view(s) are being evaluated, e.g.: CLEAR3")
-        (begin
-          (boss-eval (DefineView CLEAR3 (Filter (ClearViews) (Greater A 1))))
-          (boss-eval (QueryView CLEAR3))))
+  (test "ClearViews inside stored expression blocked at define time"
+      #f
+      (boss-eval (DefineView CLEAR3 (Filter (ClearViews) (Greater A 1)))))
 
   (test "ClearViews is idempotent on empty registry"
         #t
