@@ -64,7 +64,15 @@
         (begin
           (ve-eval (DefineView QTD_TARGET (Table (A 1 2 3))))
           (ve-eval (DefineView BAD_QUERY_DROP
-              (Filter (QueryView QTD_TARGET) (DropView QTD_TARGET)))))))
+              (Filter (QueryView QTD_TARGET) (DropView QTD_TARGET))))))
+
+  (test "DefineView with QueryView with no argument returns false"
+        #f
+        (ve-eval (DefineView BAD_QV_NO_ARG (Filter (QueryView) (Greater A 1)))))
+
+  (test "DefineView with QueryView with non-symbol argument returns false"
+        #f
+        (ve-eval (DefineView BAD_QV_INT_ARG (Filter (QueryView 42) (Greater A 1))))))
 
 
 (test-group "QueryView"

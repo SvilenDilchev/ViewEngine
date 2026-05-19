@@ -37,9 +37,11 @@ static void walkViews(const Expression &expr, WalkResult &result) {
                    auto const &dynamics = ce.getDynamicArguments();
                    auto head = ce.getHead();
                    if (head == "QueryView"_) {
-                     if (!dynamics.empty())
-                       if (auto *sym = std::get_if<Symbol>(&dynamics[0]))
-                         result.dependencies.insert(sym->getName());
+                     if (dynamics.empty() || !std::get_if<Symbol>(&dynamics[0])) {
+                       result.sideEffect = true; // Treat malformed QueryView as side effect
+                       return;
+                     }
+                     result.dependencies.insert(std::get_if<Symbol>(&dynamics[0])->getName());
                      return;
                    }
                    if (head == "DefineView"_ || head == "DropView"_ || head == "ClearViews"_ ||
