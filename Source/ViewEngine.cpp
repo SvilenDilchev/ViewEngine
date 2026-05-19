@@ -197,16 +197,15 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
             }
 
             if (head == "DropView"_) {
-              if (!topLevel) {
-                throw std::runtime_error("DropView can only be used at the top level");
-              }
+              if (!topLevel)
+                return Expression(false); // DropView can only be used at the top level
 
               if (dynamics.size() != 1)
-                throw std::runtime_error("DropView requires exactly 1 symbol argument");
+                return Expression(false); // DropView requires exactly 1 argument
 
               auto *name = std::get_if<Symbol>(&dynamics[0]);
               if (!name)
-                throw std::runtime_error("DropView argument must be a symbol");
+                return Expression(false); // DropView requires a symbol argument for the view name
 
               auto viewName = name->getName();
               if (evaluationStack.count(viewName))
@@ -218,17 +217,20 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
                                            " depends on it");
               }
 
-              viewRegistry.erase(viewName);
+              auto it = viewRegistry.find(viewName);
+              if (it == viewRegistry.end())
+                return Expression(false); // Dropping a non-existent view fails gracefully
+
+              viewRegistry.erase(it);
               return Expression(true);
             }
 
             if (head == "ClearViews"_) {
-              if (!topLevel) {
-                throw std::runtime_error("ClearViews can only be used at the top level");
-              }
+              if (!topLevel)
+                return Expression(false); // ClearViews can only be used at the top level
 
               if (!dynamics.empty())
-                throw std::runtime_error("ClearViews does not take any arguments");
+                return Expression(false); // ClearViews does not take any arguments
 
               if (!evaluationStack.empty())
                 throw std::runtime_error(
