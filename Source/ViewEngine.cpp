@@ -27,8 +27,7 @@ static std::unordered_set<std::string> evaluationStack;         // Guard against
 
 struct WalkResult {
   std::unordered_set<std::string> dependencies;
-  std::unordered_set<std::string> dropped;
-  bool callsClearViews = false;
+  bool sideEffect = false;
 };
 
 // Used to build the dependency graph with direct dependencies and detect calls to ClearViews
@@ -43,14 +42,9 @@ static void walkViews(const Expression &expr, WalkResult &result) {
                          result.dependencies.insert(sym->getName());
                      return;
                    }
-                   if (head == "DropView"_) {
-                     if (!dynamics.empty())
-                       if (auto *sym = std::get_if<Symbol>(&dynamics[0]))
-                         result.dropped.insert(sym->getName());
-                     return;
-                   }
-                   if (head == "ClearViews"_) {
-                     result.callsClearViews = true;
+                   if (head == "DefineView"_ || head == "DropView"_ || head == "ClearViews"_ ||
+                       head == "CacheView"_) {
+                     result.sideEffect = true;
                      return;
                    }
                    for (const auto &arg : dynamics) {
@@ -89,6 +83,10 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
             auto [head, statics, dynamics, spans] = std::move(ce).decompose();
 
             if (head == "DefineView"_) {
+              if (!topLevel) {
+                return Expression(false); // DefineView cannot be nested within other expressions
+              }
+
               if (dynamics.size() != 2)
                 return Expression(false); // DefineView requires exactly 2 arguments: a symbol for
                                           // the view name and an expression for the view definition
@@ -102,16 +100,12 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
               walkViews(dynamics[1], result); // Walk the view expression to collect data for
                                               // dependency graph construction and validation
 
-              if (result.callsClearViews || result.dropped.count(viewName))
-                // Block if definition calls ClearViews or drops itself directly
+              if (result.sideEffect)
+                // Block if definition has side effects such as defining or dropping views
                 return Expression(false);
 
               std::unordered_set<std::string> visited;
               for (const auto &dep : result.dependencies) {
-                if (result.dropped.count(dep))
-                  // Block if definition drops any views it depends on
-                  return Expression(false);
-
                 if (hasCycle(viewName, dep, visited))
                   return Expression(false); // Block if definition creates a cycle
               }
@@ -155,7 +149,7 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
                   evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION));
 
               if (!topLevel) {
-                // Only cache top-level calls to QueryView avoid nesting CacheViews, 
+                // Only cache top-level calls to QueryView avoid nesting CacheViews,
                 // which would cause issues to other engines evaluating
                 return std::move(result);
               }
@@ -167,6 +161,10 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
             }
 
             if (head == "CacheView"_) {
+              if (!topLevel) {
+                throw std::runtime_error("CacheView can only be used at the top level");
+              }
+
               if (dynamics.size() != 2)
                 throw std::runtime_error("CacheView requires exactly 2 arguments");
 
@@ -185,6 +183,10 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
             }
 
             if (head == "DropView"_) {
+              if (!topLevel) {
+                throw std::runtime_error("DropView can only be used at the top level");
+              }
+
               if (dynamics.size() != 1)
                 throw std::runtime_error("DropView requires exactly 1 symbol argument");
 
@@ -207,6 +209,10 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
             }
 
             if (head == "ClearViews"_) {
+              if (!topLevel) {
+                throw std::runtime_error("ClearViews can only be used at the top level");
+              }
+
               if (!dynamics.empty())
                 throw std::runtime_error("ClearViews does not take any arguments");
 

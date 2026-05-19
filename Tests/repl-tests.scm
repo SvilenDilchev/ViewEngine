@@ -145,15 +145,10 @@
               (Filter (DefineView INNER2 (Table (A 1 2 3))) (Greater A 1))))
           (ve-eval (QueryView INNER2))))
 
-  ;; Querying OUTER4 registers INNER3 as a side effect (returns bool in place of DefineView)
-  ;; then querying INNER3 succeeds
-  (test "Querying outer registers inner as side effect"
-        '(Table (A 1 2 3))
-        (begin
-          (ve-eval (DefineView OUTER4
-              (Filter (DefineView INNER3 (Table (A 1 2 3))) (Greater A 1))))
-          (ve-eval (QueryView OUTER4))
-          (ve-eval (QueryView INNER3))))
+  (test "DefineView with nested DefineView side effect returns false"
+      #f
+      (ve-eval (DefineView OUTER4
+          (Filter (DefineView INNER3 (Table (A 1 2 3))) (Greater A 1)))))
 
   ;; OUTER5 contains a nested DefineView whose body references OUTER5 itself via QueryView.
   ;; collectDeps finds QueryView OUTER5 inside the nested DefineView body and blocks at define time.
@@ -291,18 +286,17 @@
           (ve-eval (DefineView DEP_CHILD3 (Table (B 4 5 6)))) ;; redefine removes dep
           (ve-eval (DropView DEP_BASE3))))
 
-  (test "QueryView on view with DropView of unrelated view succeeds and drops it"
-        '(Filter (Table (A 1 2 3)) #t)
-        (begin
-          (ve-eval (DefineView DROP_SIDE_DATA (Table (A 1 2 3))))
-          (ve-eval (DefineView DROP_SIDE_UNRELATED (Table (B 4 5 6))))
-          (ve-eval (DefineView DROP_SIDE_VIEW
-              (Filter (QueryView DROP_SIDE_DATA) (DropView DROP_SIDE_UNRELATED))))
-          (ve-eval (QueryView DROP_SIDE_VIEW))))
+  (test "DefineView with nested DropView side effect returns false"
+      #f
+      (begin
+        (ve-eval (DefineView DROP_SIDE_DATA (Table (A 1 2 3))))
+        (ve-eval (DefineView DROP_SIDE_UNRELATED (Table (B 4 5 6))))
+        (ve-eval (DefineView DROP_SIDE_VIEW
+            (Filter (QueryView DROP_SIDE_DATA) (DropView DROP_SIDE_UNRELATED))))))
 
-  (test "Unrelated view is gone after drop side effect"
-        '(ErrorWhenEvaluatingExpression (||) "View not found: DROP_SIDE_UNRELATED")
-        (ve-eval (QueryView DROP_SIDE_UNRELATED))))
+  (test "Unrelated view still exists after blocked side effect define"
+      '(Table (B 4 5 6))
+      (ve-eval (QueryView DROP_SIDE_UNRELATED))))
 
 
 (test-group "ClearViews"
