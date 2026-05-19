@@ -34,6 +34,8 @@ struct WalkResult {
 static void walkViews(const Expression &expr, WalkResult &result) {
   std::visit(boss::utilities::overload(
                  [&](const ComplexExpression &ce) {
+                   if (result.sideEffect)
+                     return; // Short circuit if we've already detected a side effect
                    auto const &dynamics = ce.getDynamicArguments();
                    auto head = ce.getHead();
                    if (head == "QueryView"_) {
@@ -79,11 +81,15 @@ static bool hasCycle(const std::string &newView, const std::string &current,
 }
 
 // Invalidate caches of all views that directly or indirectly depend on the given view
-static void invalidateDependentCaches(const std::string &invalidatedView) {
+static void invalidateDependentCaches(const std::string &invalidatedView,
+                                      std::unordered_set<std::string> &seen) {
   for (auto &[name, entry] : viewRegistry) {
+    if (seen.count(name))
+      continue;
     if (entry.dependencies.count(invalidatedView)) {
       entry.cached = std::nullopt;
-      invalidateDependentCaches(name);
+      seen.insert(name);
+      invalidateDependentCaches(name, seen);
     }
   }
 }
@@ -122,7 +128,8 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
                   return Expression(false); // Block if definition creates a cycle
               }
 
-              invalidateDependentCaches(viewName);
+              std::unordered_set<std::string> seen;
+              invalidateDependentCaches(viewName, seen);
 
               viewRegistry[viewName] =
                   ViewEntry{std::nullopt, std::move(dynamics[1]), std::move(result.dependencies)};
@@ -162,11 +169,14 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
               auto result =
                   evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION));
 
-              if (!topLevel) {
+              if (!topLevel)
                 // Only cache top-level calls to QueryView avoid nesting CacheViews,
                 // which would cause issues to other engines evaluating
                 return std::move(result);
-              }
+
+              // Cache the evaluated result for cases where only one instance
+              // of ViewEngine is present and noone can consume the CacheView wrapper 
+              entry.cached = result.clone(CloneReason::EXPRESSION_WRAPPING);
 
               boss::expressions::ExpressionArguments cacheArgs;
               cacheArgs.emplace_back(Symbol(viewName));
