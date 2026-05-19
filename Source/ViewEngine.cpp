@@ -175,7 +175,7 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
                 return std::move(result);
 
               // Cache the evaluated result for cases where only one instance
-              // of ViewEngine is present and noone can consume the CacheView wrapper 
+              // of ViewEngine is present and noone can consume the CacheView wrapper
               entry.cached = result.clone(CloneReason::EXPRESSION_WRAPPING);
 
               boss::expressions::ExpressionArguments cacheArgs;
