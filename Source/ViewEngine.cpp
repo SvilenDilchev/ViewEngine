@@ -76,6 +76,16 @@ static bool hasCycle(const std::string &newView, const std::string &current,
   return false;
 }
 
+// Invalidate caches of all views that directly or indirectly depend on the given view
+static void invalidateDependentCaches(const std::string &invalidatedView) {
+  for (auto &[name, entry] : viewRegistry) {
+    if (entry.dependencies.count(invalidatedView)) {
+      entry.cached = std::nullopt;
+      invalidateDependentCaches(name);
+    }
+  }
+}
+
 static Expression evaluate(Expression &&e, bool topLevel = false) {
   return std::visit(
       boss::utilities::overload(
@@ -109,6 +119,8 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
                 if (hasCycle(viewName, dep, visited))
                   return Expression(false); // Block if definition creates a cycle
               }
+
+              invalidateDependentCaches(viewName);
 
               viewRegistry[viewName] =
                   ViewEntry{std::nullopt, std::move(dynamics[1]), std::move(result.dependencies)};
