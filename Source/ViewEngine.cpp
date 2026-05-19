@@ -4,6 +4,7 @@
 #include <Utilities.hpp>
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -16,6 +17,7 @@ using boss::Expression;
 using boss::expressions::CloneReason;
 
 struct ViewEntry {
+  std::optional<Expression> cached;
   Expression definition;
   std::unordered_set<std::string> dependencies;
 };
@@ -80,10 +82,10 @@ static bool hasCycle(const std::string &newView, const std::string &current,
   return false;
 }
 
-static Expression evaluate(Expression &&e) {
+static Expression evaluate(Expression &&e, bool topLevel = false) {
   return std::visit(
       boss::utilities::overload(
-          [](ComplexExpression &&ce) -> Expression {
+          [topLevel](ComplexExpression &&ce) -> Expression {
             auto [head, statics, dynamics, spans] = std::move(ce).decompose();
 
             if (head == "DefineView"_) {
@@ -100,8 +102,9 @@ static Expression evaluate(Expression &&e) {
               walkViews(dynamics[1], result); // Walk the view expression to collect data for
                                               // dependency graph construction and validation
 
-              if (result.callsClearViews)
-                return Expression(false); // Block if definition calls ClearViews
+              if (result.callsClearViews || result.dropped.count(viewName))
+                // Block if definition calls ClearViews or drops itself directly
+                return Expression(false);
 
               std::unordered_set<std::string> visited;
               for (const auto &dep : result.dependencies) {
@@ -114,7 +117,8 @@ static Expression evaluate(Expression &&e) {
               }
 
               viewRegistry[viewName] =
-                  ViewEntry{std::move(dynamics[1]), std::move(result.dependencies)};
+                  ViewEntry{std::nullopt, std::move(dynamics[1]), std::move(result.dependencies)};
+
               return Expression(true);
             }
 
@@ -134,13 +138,50 @@ static Expression evaluate(Expression &&e) {
               if (evaluationStack.count(viewName))
                 throw std::runtime_error("Circular view dependency detected: " + viewName);
 
+              ViewEntry &entry = it->second;
+              if (entry.cached)
+                // Return cached result if available
+                return entry.cached->clone(CloneReason::EVALUATE_CONST_EXPRESSION);
+
               evaluationStack.insert(viewName);
               struct EvaluationGuard { // RAII guard for evaluation stack cleanup
                 std::string viewName;
                 ~EvaluationGuard() { evaluationStack.erase(viewName); }
               } guard{viewName};
 
-              return evaluate(it->second.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION));
+              // Cache miss - wrap, evaluate, and pass through to other engines
+              // Second pass will unwrap and save to cache
+              auto result =
+                  evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION));
+
+              if (!topLevel) {
+                // Only cache top-level calls to QueryView avoid nesting CacheViews, 
+                // which would cause issues to other engines evaluating
+                return std::move(result);
+              }
+
+              boss::expressions::ExpressionArguments cacheArgs;
+              cacheArgs.emplace_back(Symbol(viewName));
+              cacheArgs.emplace_back(std::move(result));
+              return Expression(ComplexExpression("CacheView"_, {}, std::move(cacheArgs), {}));
+            }
+
+            if (head == "CacheView"_) {
+              if (dynamics.size() != 2)
+                throw std::runtime_error("CacheView requires exactly 2 arguments");
+
+              auto *name = std::get_if<Symbol>(&dynamics[0]);
+              if (!name)
+                throw std::runtime_error("CacheView first argument must be a symbol");
+
+              auto viewName = name->getName();
+              auto it = viewRegistry.find(viewName);
+              if (it == viewRegistry.end())
+                throw std::runtime_error("View not found for caching: " + viewName);
+
+              // Cache the evaluated result and return it
+              it->second.cached = dynamics[1].clone(CloneReason::EXPRESSION_WRAPPING);
+              return std::move(dynamics[1]);
             }
 
             if (head == "DropView"_) {
@@ -203,8 +244,13 @@ static Expression evaluate(Expression &&e) {
               return Expression(ComplexExpression("ViewList"_, {}, std::move(columns), {}));
             }
 
-            for (auto &arg : dynamics) {
-              arg = evaluate(std::move(arg)); // Recursively evaluate arguments of other expressions
+            // Recursively evaluate arguments of other expressions
+            // Do not eval args for ViewList to preserve view definitions for output
+            // Check is here to block eval on second pass through ViewEngine in pipeline
+            if (head != "ViewList"_) {
+              for (auto &arg : dynamics) {
+                arg = evaluate(std::move(arg));
+              }
             }
 
             return Expression(ComplexExpression(std::move(head), std::move(statics),
@@ -215,5 +261,5 @@ static Expression evaluate(Expression &&e) {
 }
 
 extern "C" BOSSExpression *evaluate(BOSSExpression *e) {
-  return new BOSSExpression{.delegate = evaluate(std::move(e->delegate))};
+  return new BOSSExpression{.delegate = evaluate(std::move(e->delegate), true)};
 };
