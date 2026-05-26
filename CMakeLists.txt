@@ -70,7 +70,11 @@ else()
   set(LibraryType MODULE)
 endif(MSVC)
 
-add_library(ViewEngine ${LibraryType} Source/ViewEngine.cpp)
+add_library(ViewEngine ${LibraryType}
+  Source/ViewEngine.cpp
+  Source/ViewRegistry.cpp
+  Source/QueryRewriter.cpp
+)
 
 set_property(TARGET ViewEngine PROPERTY CXX_STANDARD 23)
 if(MSVC)

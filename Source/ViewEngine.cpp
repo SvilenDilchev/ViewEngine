@@ -1,103 +1,22 @@
-#include <BOSS.hpp>
-#include <Expression.hpp>
-#include <ExpressionUtilities.hpp>
-#include <Utilities.hpp>
+#include "ViewRegistry.hpp"
 
-#include <algorithm>
-#include <optional>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
-
-using boss::utilities::operator""_;
-using boss::ComplexExpression;
-using boss::Symbol;
-
-using boss::Expression;
 using boss::expressions::CloneReason;
 
-struct ViewEntry {
-  std::optional<Expression> cached;
-  Expression definition;
-  std::unordered_set<std::string> dependencies;
-};
-
-static std::unordered_map<std::string, ViewEntry> viewRegistry; // In memory register of Views
-static std::unordered_set<std::string> evaluationStack;         // Guard against runtime cycles
-
-struct WalkResult {
-  std::unordered_set<std::string> dependencies;
-  bool sideEffect = false;
-};
-
-// Used to build the dependency graph with direct dependencies and detect calls to ClearViews
-static void walkViews(const Expression &expr, WalkResult &result) {
-  std::visit(boss::utilities::overload(
-                 [&](const ComplexExpression &ce) {
-                   if (result.sideEffect)
-                     return; // Short circuit if we've already detected a side effect
-                   auto const &dynamics = ce.getDynamicArguments();
-                   auto head = ce.getHead();
-                   if (head == "QueryView"_) {
-                     if (dynamics.empty() || !std::get_if<Symbol>(&dynamics[0])) {
-                       result.sideEffect = true; // Treat malformed QueryView as side effect
-                       return;
-                     }
-                     result.dependencies.insert(std::get_if<Symbol>(&dynamics[0])->getName());
-                     return;
-                   }
-                   if (head == "DefineView"_ || head == "DropView"_ || head == "ClearViews"_ ||
-                       head == "CacheView"_) {
-                     result.sideEffect = true;
-                     return;
-                   }
-                   for (const auto &arg : dynamics) {
-                     walkViews(arg, result);
-                   }
-                 },
-                 [](const auto &) {}),
-             expr);
-}
-
-// DFS traversal to detect cycles in the dependency graph
-static bool hasCycle(const std::string &newView, const std::string &current,
-                     std::unordered_set<std::string> &visited) {
-  if (current == newView)
-    return true;
-
-  if (visited.count(current))
-    return false;
-
-  visited.insert(current);
-  auto it = viewRegistry.find(current);
-  if (it == viewRegistry.end())
-    return false;
-
-  for (const auto &dep : it->second.dependencies)
-    if (hasCycle(newView, dep, visited))
-      return true;
-
-  return false;
-}
-
-// Invalidate caches of all views that directly or indirectly depend on the given view
-static void invalidateDependentCaches(const std::string &invalidatedView,
-                                      std::unordered_set<std::string> &seen) {
-  for (auto &[name, entry] : viewRegistry) {
-    if (seen.count(name))
-      continue;
-    if (entry.dependencies.count(invalidatedView)) {
-      entry.cached = std::nullopt;
-      seen.insert(name);
-      invalidateDependentCaches(name, seen);
+static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLevel = false) {
+  // Attempt to rewrite incoming query using view definitions top-down
+  // Skip rewrite if incoming expression was generated from a evaluation of a QueryView
+  if (!skipRewrite) {
+    if (auto match = findRewriting(e)) {
+      boss::ExpressionArguments args;
+      args.emplace_back(Symbol(*match));
+      return evaluate(Expression(ComplexExpression("QueryView"_, {}, std::move(args), {})),
+                      skipRewrite, topLevel);
     }
   }
-}
 
-static Expression evaluate(Expression &&e, bool topLevel = false) {
   return std::visit(
       boss::utilities::overload(
-          [topLevel](ComplexExpression &&ce) -> Expression {
+          [skipRewrite, topLevel](ComplexExpression &&ce) -> Expression {
             auto [head, statics, dynamics, spans] = std::move(ce).decompose();
 
             if (head == "DefineView"_) {
@@ -114,16 +33,18 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
                 return Expression(false); // DefineView requires a symbol for the view name
 
               auto viewName = name->getName();
-              WalkResult result;
-              walkViews(dynamics[1], result); // Walk the view expression to collect data for
-                                              // dependency graph construction and validation
+              ViewMetadata metadata;
+              SourceSets sources;
+              walkView(dynamics[1], metadata,
+                       sources); // Walk the view expression to collect data for
+                                 // dependency graph construction and validation
 
-              if (result.sideEffect)
+              if (metadata.sideEffect)
                 // Block if definition has side effects such as defining or dropping views
                 return Expression(false);
 
               std::unordered_set<std::string> visited;
-              for (const auto &dep : result.dependencies) {
+              for (const auto &dep : metadata.dependencies) {
                 if (hasCycle(viewName, dep, visited))
                   return Expression(false); // Block if definition creates a cycle
               }
@@ -131,8 +52,23 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
               std::unordered_set<std::string> seen;
               invalidateDependentCaches(viewName, seen);
 
+              // Remove old index entries if view already exists
+              if (auto existing = viewRegistry.find(viewName); existing != viewRegistry.end()) {
+                for (const auto &[tableName, _] : existing->second.signature.tablePredicates)
+                  tableToViews[tableName].erase(viewName);
+                for (const auto &dep : existing->second.dependencies)
+                  viewToViews[dep].erase(viewName);
+              }
+
+              // Add new index entries
+              for (const auto &[tableName, _] : metadata.signature.tablePredicates)
+                tableToViews[tableName].insert(viewName);
+              for (const auto &dep : metadata.dependencies)
+                viewToViews[dep].insert(viewName);
+
               viewRegistry[viewName] =
-                  ViewEntry{std::nullopt, std::move(dynamics[1]), std::move(result.dependencies)};
+                  ViewEntry{std::nullopt, std::move(dynamics[1]), std::move(metadata.dependencies),
+                            std::move(metadata.signature)};
 
               return Expression(true);
             }
@@ -167,7 +103,7 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
               // Cache miss - wrap, evaluate, and pass through to other engines
               // Second pass will unwrap and save to cache
               auto result =
-                  evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION));
+                  evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION), true);
 
               if (!topLevel)
                 // Only cache top-level calls to QueryView avoid nesting CacheViews,
@@ -221,15 +157,20 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
               if (evaluationStack.count(viewName))
                 throw std::runtime_error("Cannot drop view currently being evaluated: " + viewName);
 
-              for (const auto &[dependent, entry] : viewRegistry) {
-                if (entry.dependencies.count(viewName))
-                  throw std::runtime_error("Cannot drop view " + viewName + ": " + dependent +
-                                           " depends on it");
-              }
+              if (auto it = viewToViews.find(viewName);
+                  it != viewToViews.end() && !it->second.empty())
+                throw std::runtime_error("Cannot drop view " + viewName + ": " +
+                                         *it->second.begin() + " depends on it");
 
               auto it = viewRegistry.find(viewName);
               if (it == viewRegistry.end())
                 return Expression(false); // Dropping a non-existent view fails gracefully
+
+              // Cleanup indexes
+              for (const auto &[tableName, _] : it->second.signature.tablePredicates)
+                tableToViews[tableName].erase(viewName);
+              for (const auto &dep : it->second.dependencies)
+                viewToViews[dep].erase(viewName);
 
               viewRegistry.erase(it);
               return Expression(true);
@@ -248,6 +189,8 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
                     " view(s) are being evaluated, e.g.: " + *evaluationStack.begin());
 
               viewRegistry.clear();
+              tableToViews.clear();
+              viewToViews.clear();
               return Expression(true);
             }
 
@@ -281,7 +224,7 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
             // Check is here to block eval on second pass through ViewEngine in pipeline
             if (head != "ViewList"_) {
               for (auto &arg : dynamics) {
-                arg = evaluate(std::move(arg));
+                arg = evaluate(std::move(arg), skipRewrite);
               }
             }
 
@@ -293,5 +236,5 @@ static Expression evaluate(Expression &&e, bool topLevel = false) {
 }
 
 extern "C" BOSSExpression *evaluate(BOSSExpression *e) {
-  return new BOSSExpression{.delegate = evaluate(std::move(e->delegate), true)};
+  return new BOSSExpression{.delegate = evaluate(std::move(e->delegate), false, true)};
 };
