@@ -1,3 +1,4 @@
+#include "CachingProtocol.hpp"
 #include "ViewRegistry.hpp"
 
 using boss::expressions::CloneReason;
@@ -74,12 +75,20 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
             }
 
             if (head == "QueryView"_) {
-              if (dynamics.size() != 1)
-                throw std::runtime_error("QueryView requires exactly 1 symbol argument");
+              if (dynamics.size() < 1 || dynamics.size() > 2)
+                throw std::runtime_error("QueryView requires 1 or 2 arguments");
 
               auto *name = std::get_if<Symbol>(&dynamics[0]);
               if (!name)
-                throw std::runtime_error("QueryView argument must be a symbol");
+                throw std::runtime_error("QueryView first argument must be a symbol");
+
+              bool shouldCache = false;
+              if (dynamics.size() == 2) {
+                auto *flag = std::get_if<bool>(&dynamics[1]);
+                if (!flag)
+                  throw std::runtime_error("QueryView second argument must be a boolean");
+                shouldCache = *flag;
+              }
 
               auto viewName = name->getName();
               auto it = viewRegistry.find(viewName);
@@ -105,11 +114,23 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
               auto result =
                   evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION), true);
 
-              if (!topLevel)
-                // Only cache top-level calls to QueryView avoid nesting CacheViews,
-                // which would cause issues to other engines evaluating
-                return std::move(result);
+              if (!shouldCache)
+                return std::move(result); // Return without caching
 
+              // If nested call, return a CacheRef to be resolved by handled by subsequent engines
+              if (!topLevel) {
+                // Check if already registered to avoid duplicates
+                auto it = std::find_if(
+                    defaultPendingCacheRegistry.begin(), defaultPendingCacheRegistry.end(),
+                    [&viewName](auto const &entry) { return entry.first == viewName; });
+                if (it == defaultPendingCacheRegistry.end()) {
+                  defaultPendingCacheRegistry.emplace_back(viewName, std::move(result));
+                  // No need to update te lookup since it never gets used in ViewEngine
+                }
+                boss::ExpressionArguments cacheRefArgs;
+                cacheRefArgs.emplace_back(Symbol(viewName));
+                return Expression(ComplexExpression("CacheRef"_, {}, std::move(cacheRefArgs), {}));
+              }
               // Cache the evaluated result for cases where only one instance
               // of ViewEngine is present and noone can consume the CacheView wrapper
               entry.cached = result.clone(CloneReason::EXPRESSION_WRAPPING);
@@ -118,6 +139,30 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
               cacheArgs.emplace_back(Symbol(viewName));
               cacheArgs.emplace_back(std::move(result));
               return Expression(ComplexExpression("CacheView"_, {}, std::move(cacheArgs), {}));
+            }
+
+            if (head == "WithPendingCaches"_) {
+              if (!topLevel) {
+                throw std::runtime_error("WithPendingCaches can only be used at the top level");
+              }
+
+              auto finalExpr = unpackWithPendingCaches(
+                  Expression(ComplexExpression(std::move(head), std::move(statics),
+                                               std::move(dynamics), std::move(spans))),
+                  defaultPendingCacheRegistry, defaultPendingCacheLookup);
+
+              for (auto &[name, expr] : defaultPendingCacheRegistry) {
+                auto it = viewRegistry.find(name);
+                if (it != viewRegistry.end())
+                  // Evaluate to handle leftover CacheRef operators
+                  it->second.cached = evaluate(std::move(expr), false, false);
+              }
+              defaultPendingCacheRegistry.clear();
+              defaultPendingCacheLookup.clear();
+
+              // Eval with the final expression as a top-level expression, so that a CacheView
+              // operator will be correctly handled and cached
+              return evaluate(std::move(finalExpr), true, true);
             }
 
             if (head == "CacheView"_) {
@@ -139,7 +184,30 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
 
               // Cache the evaluated result and return it
               it->second.cached = dynamics[1].clone(CloneReason::EXPRESSION_WRAPPING);
-              return std::move(dynamics[1]);
+              // Evaluate the expression to handle leftover CacheRef operators
+              return evaluate(std::move(dynamics[1]), false, false);
+            }
+
+            // Handle leftover CacheRef operators in the pipeline on second pass
+            if (head == "CacheRef"_) {
+              if (dynamics.size() != 1)
+                throw std::runtime_error("CacheRef requires exactly 1 symbol argument");
+
+              auto *name = std::get_if<Symbol>(&dynamics[0]);
+              if (!name)
+                throw std::runtime_error("CacheRef argument must be a symbol");
+
+              auto viewName = name->getName();
+              auto it = viewRegistry.find(viewName);
+              if (it == viewRegistry.end())
+                throw std::runtime_error("CacheRef could not be resolved, view not found: " +
+                                         viewName);
+              if (!it->second.cached)
+                throw std::runtime_error("CacheRef could not be resolved, view not cached: " +
+                                         viewName);
+
+              // The view should have already been cached by the WithPendingCaches handler
+              return it->second.cached->clone(CloneReason::EVALUATE_CONST_EXPRESSION);
             }
 
             if (head == "DropView"_) {
@@ -236,5 +304,12 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
 }
 
 extern "C" BOSSExpression *evaluate(BOSSExpression *e) {
-  return new BOSSExpression{.delegate = evaluate(std::move(e->delegate), false, true)};
-};
+  defaultPendingCacheRegistry.clear();
+  defaultPendingCacheLookup.clear();
+  auto result = evaluate(std::move(e->delegate), false, true);
+
+  if (defaultPendingCacheRegistry.empty())
+    return new BOSSExpression{.delegate = std::move(result)};
+  return new BOSSExpression{.delegate = repackWithPendingCaches(
+                                std::move(defaultPendingCacheRegistry), std::move(result))};
+}

@@ -101,11 +101,19 @@
 (test-group "QueryView errors"
 
   (test "QueryView with no arguments throws"
-        '(ErrorWhenEvaluatingExpression (||) "QueryView requires exactly 1 symbol argument")
+        '(ErrorWhenEvaluatingExpression (||) "QueryView requires 1 or 2 arguments")
         (ve-eval (QueryView)))
 
   (test "QueryView with too many arguments throws"
-        '(ErrorWhenEvaluatingExpression (||) "QueryView requires exactly 1 symbol argument")
+        '(ErrorWhenEvaluatingExpression (||) "QueryView requires 1 or 2 arguments")
+        (begin
+          (ve-eval (DefineView V1 (Table (A 1))))
+          (ve-eval (DefineView V2 (Table (A 2))))
+          (ve-eval (DefineView V3 (Table (A 3))))
+          (ve-eval (QueryView V1 V2 V3))))
+
+  (test "QueryView with non-boolean second argument throws"
+        '(ErrorWhenEvaluatingExpression (||) "QueryView second argument must be a boolean")
         (begin
           (ve-eval (DefineView V1 (Table (A 1))))
           (ve-eval (DefineView V2 (Table (A 2))))
@@ -116,13 +124,25 @@
         (ve-eval (QueryView NONEXISTENT)))
 
   (test "QueryView with integer argument throws"
-        '(ErrorWhenEvaluatingExpression (||) "QueryView argument must be a symbol")
+        '(ErrorWhenEvaluatingExpression (||) "QueryView first argument must be a symbol")
         (ve-eval (QueryView 123)))
 
   (test "QueryView with expression argument throws"
-        '(ErrorWhenEvaluatingExpression (||) "QueryView argument must be a symbol")
-        (ve-eval (QueryView (Table (A 1 2 3))))))
+        '(ErrorWhenEvaluatingExpression (||) "QueryView first argument must be a symbol")
+        (ve-eval (QueryView (Table (A 1 2 3)))))
 
+  (test "QueryView with cache flag true resolves view"
+        '(Table (A 1 2 3))
+        (begin
+          (ve-eval (DefineView CACHED_VIEW (Table (A 1 2 3))))
+          (ve-eval (QueryView CACHED_VIEW #t))))
+
+  (test "QueryView with cache flag false resolves view"
+        '(Table (A 1 2 3))
+        (begin
+          (ve-eval (DefineView UNCACHED_VIEW (Table (A 1 2 3))))
+          (ve-eval (QueryView UNCACHED_VIEW #f)))))
+      
 
 (test-group "Nested views"
 

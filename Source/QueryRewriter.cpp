@@ -81,123 +81,128 @@ static bool isSafeUnmatchedJoin(const JoinEdge &viewEdge, const Signature &query
 }
 
 void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &sources) {
-  std::visit(boss::utilities::overload(
-                 [&](const ComplexExpression &ce) {
-                   if (metadata.sideEffect)
-                     return; // Short circuit if we've already detected a side effect
+  std::visit(
+      boss::utilities::overload(
+          [&](const ComplexExpression &ce) {
+            if (metadata.sideEffect)
+              return; // Short circuit if we've already detected a side effect
 
-                   const auto &head = ce.getHead();
-                   const auto &dynamics = ce.getDynamicArguments();
+            const auto &head = ce.getHead();
+            const auto &dynamics = ce.getDynamicArguments();
 
-                   if (head == "QueryView"_) {
-                     if (dynamics.empty() || !std::get_if<Symbol>(&dynamics[0])) {
-                       metadata.sideEffect = true; // Treat malformed QueryView as side effect
-                       return;
-                     }
-                     const auto &viewName = std::get_if<Symbol>(&dynamics[0])->getName();
-                     metadata.dependencies.insert(viewName);
-                     metadata.signature.viewPredicates.try_emplace(viewName);
-                     sources.second.insert(viewName);
-                     return;
-                   }
+            if (head == "QueryView"_) {
+              if (dynamics.empty() || dynamics.size() > 2 || !std::get_if<Symbol>(&dynamics[0])) {
+                metadata.sideEffect = true; // Treat malformed QueryView as side effect
+                return;
+              }
+              if (dynamics.size() == 2 && !std::get_if<bool>(&dynamics[1])) {
+                metadata.sideEffect = true; // Second arg must be a boolean if present
+                return;
+              }
+              
+              const auto &viewName = std::get_if<Symbol>(&dynamics[0])->getName();
+              metadata.dependencies.insert(viewName);
+              metadata.signature.viewPredicates.try_emplace(viewName);
+              sources.second.insert(viewName);
+              return;
+            }
 
-                   // Detect side prohibited effects
-                   if (sideEffectOperators.count(head.getName())) {
-                     metadata.sideEffect = true;
-                     return;
-                   }
+            // Detect side prohibited effects
+            if (sideEffectOperators.count(head.getName())) {
+              metadata.sideEffect = true;
+              return;
+            }
 
-                   if (head == "ByName"_) {
-                     if (dynamics.empty() || !std::get_if<Symbol>(&dynamics[0])) {
-                       metadata.sideEffect = true; // Treat malformed ByName as side effect since
-                       return;
-                     }
-                     const auto &viewName = std::get_if<Symbol>(&dynamics[0])->getName();
-                     metadata.signature.tablePredicates.try_emplace(viewName);
-                     sources.first.insert(viewName);
-                     return;
-                   }
+            if (head == "ByName"_) {
+              if (dynamics.empty() || !std::get_if<Symbol>(&dynamics[0])) {
+                metadata.sideEffect = true; // Treat malformed ByName as side effect since
+                return;
+              }
+              const auto &viewName = std::get_if<Symbol>(&dynamics[0])->getName();
+              metadata.signature.tablePredicates.try_emplace(viewName);
+              sources.first.insert(viewName);
+              return;
+            }
 
-                   if (head == "Filter"_) {
-                     if (dynamics.size() != 2) {
-                       metadata.sideEffect = true; // Treat malformed Filter as side effect
-                       return;
-                     }
+            if (head == "Filter"_) {
+              if (dynamics.size() != 2) {
+                metadata.sideEffect = true; // Treat malformed Filter as side effect
+                return;
+              }
 
-                     walkView(dynamics[0], metadata, sources);
+              walkView(dynamics[0], metadata, sources);
 
-                     // TODO: predicates are assigned to all sources in the subtree because we
-                     // lack schema information to determine which table owns which column. This
-                     // causes false positives in scoring — a view filtering orders on l_price
-                     // would incorrectly pass condition 2 because the query's predicate map also
-                     // has l_price on orders after the join. Fix: load table schemas and resolve
-                     // column-to-table ownership before assignment.
-                     assignPredicateToSources(dynamics[1].clone(CloneReason::EXPRESSION_WRAPPING),
-                                              metadata, sources);
-                     return;
-                   }
+              // TODO: predicates are assigned to all sources in the subtree because we
+              // lack schema information to determine which table owns which column. This
+              // causes false positives in scoring — a view filtering orders on l_price
+              // would incorrectly pass condition 2 because the query's predicate map also
+              // has l_price on orders after the join. Fix: load table schemas and resolve
+              // column-to-table ownership before assignment.
+              assignPredicateToSources(dynamics[1].clone(CloneReason::EXPRESSION_WRAPPING),
+                                       metadata, sources);
+              return;
+            }
 
-                   if (head == "Project"_) {
-                     if (dynamics.empty()) {
-                       metadata.sideEffect = true; // Treat malformed Project as side effect
-                       return;
-                     }
+            if (head == "Project"_) {
+              if (dynamics.empty()) {
+                metadata.sideEffect = true; // Treat malformed Project as side effect
+                return;
+              }
 
-                     walkView(dynamics[0], metadata, sources);
-                     for (size_t i = 1; i < dynamics.size(); ++i) {
-                       auto key = serializeExpr(dynamics[i]);
-                       auto shared = std::make_shared<Expression>(
-                           dynamics[i].clone(CloneReason::EXPRESSION_WRAPPING));
-                       metadata.signature.projectedColumns.emplace(std::move(key),
-                                                                   std::move(shared));
-                     }
-                     return;
-                   }
+              walkView(dynamics[0], metadata, sources);
+              for (size_t i = 1; i < dynamics.size(); ++i) {
+                auto key = serializeExpr(dynamics[i]);
+                auto shared = std::make_shared<Expression>(
+                    dynamics[i].clone(CloneReason::EXPRESSION_WRAPPING));
+                metadata.signature.projectedColumns.emplace(std::move(key), std::move(shared));
+              }
+              return;
+            }
 
-                   if (head == "Join"_ || head == "LeftJoin"_ || head == "AntiJoin"_) {
-                     if (dynamics.size() < 4) {
-                       metadata.sideEffect = true; // Treat malformed Joins as side effect
-                       return;
-                     }
+            if (head == "Join"_ || head == "LeftJoin"_ || head == "AntiJoin"_) {
+              if (dynamics.size() < 4) {
+                metadata.sideEffect = true; // Treat malformed Joins as side effect
+                return;
+              }
 
-                     SourceSets leftSources, rightSources;
-                     walkView(dynamics[0], metadata, leftSources);
-                     walkView(dynamics[2], metadata, rightSources);
+              SourceSets leftSources, rightSources;
+              walkView(dynamics[0], metadata, leftSources);
+              walkView(dynamics[2], metadata, rightSources);
 
-                     std::unordered_set<std::string> allLefts = leftSources.first;
-                     allLefts.insert(leftSources.second.begin(), leftSources.second.end());
-                     std::unordered_set<std::string> allRights = rightSources.first;
-                     allRights.insert(rightSources.second.begin(), rightSources.second.end());
+              std::unordered_set<std::string> allLefts = leftSources.first;
+              allLefts.insert(leftSources.second.begin(), leftSources.second.end());
+              std::unordered_set<std::string> allRights = rightSources.first;
+              allRights.insert(rightSources.second.begin(), rightSources.second.end());
 
-                     metadata.signature.joinEdges.push_back(
-                         {std::move(allLefts), std::move(allRights),
-                          dynamics[1].clone(CloneReason::EXPRESSION_WRAPPING),
-                          dynamics[3].clone(CloneReason::EXPRESSION_WRAPPING), head.getName()});
+              metadata.signature.joinEdges.push_back(
+                  {std::move(allLefts), std::move(allRights),
+                   dynamics[1].clone(CloneReason::EXPRESSION_WRAPPING),
+                   dynamics[3].clone(CloneReason::EXPRESSION_WRAPPING), head.getName()});
 
-                     sources.first.merge(leftSources.first);
-                     sources.first.merge(rightSources.first);
-                     sources.second.merge(leftSources.second);
-                     sources.second.merge(rightSources.second);
-                     return;
-                   }
+              sources.first.merge(leftSources.first);
+              sources.first.merge(rightSources.first);
+              sources.second.merge(leftSources.second);
+              sources.second.merge(rightSources.second);
+              return;
+            }
 
-                   // TODO: handle aggregations
-                   // For now it's with the passthroughs like ordering operators
-                   if (head == "GroupBy"_ || head == "OrderBy"_ || head == "Slice"_) {
-                     if (dynamics.empty()) {
-                       // Treat malformed passthrough operators as side effect
-                       metadata.sideEffect = true;
-                     }
-                     walkView(dynamics[0], metadata, sources);
-                     return;
-                   }
+            // TODO: handle aggregations
+            // For now it's with the passthroughs like ordering operators
+            if (head == "GroupBy"_ || head == "OrderBy"_ || head == "Slice"_) {
+              if (dynamics.empty()) {
+                // Treat malformed passthrough operators as side effect
+                metadata.sideEffect = true;
+              }
+              walkView(dynamics[0], metadata, sources);
+              return;
+            }
 
-                   for (const auto &arg : dynamics) {
-                     walkView(arg, metadata, sources);
-                   }
-                 },
-                 [](const auto &) {}),
-             expr);
+            for (const auto &arg : dynamics) {
+              walkView(arg, metadata, sources);
+            }
+          },
+          [](const auto &) {}),
+      expr);
 }
 
 double scoreView(const Signature &viewParts, const Signature &queryParts) {
