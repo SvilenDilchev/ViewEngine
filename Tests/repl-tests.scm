@@ -101,16 +101,14 @@
 (test-group "QueryView errors"
 
   (test "QueryView with no arguments throws"
-        '(ErrorWhenEvaluatingExpression (||) "QueryView requires 1 or 2 arguments")
+        '(ErrorWhenEvaluatingExpression (||) "QueryView requires 1 to 3 arguments")
         (ve-eval (QueryView)))
 
   (test "QueryView with too many arguments throws"
-        '(ErrorWhenEvaluatingExpression (||) "QueryView requires 1 or 2 arguments")
-        (begin
-          (ve-eval (DefineView V1 (Table (A 1))))
-          (ve-eval (DefineView V2 (Table (A 2))))
-          (ve-eval (DefineView V3 (Table (A 3))))
-          (ve-eval (QueryView V1 V2 V3))))
+      '(ErrorWhenEvaluatingExpression (||) "QueryView requires 1 to 3 arguments")
+      (begin
+        (ve-eval (DefineView V1 (Table (A 1))))
+        (ve-eval (QueryView V1 #t Structural ExtraArg))))
 
   (test "QueryView with non-boolean second argument throws"
         '(ErrorWhenEvaluatingExpression (||) "QueryView second argument must be a boolean")
@@ -118,6 +116,18 @@
           (ve-eval (DefineView V1 (Table (A 1))))
           (ve-eval (DefineView V2 (Table (A 2))))
           (ve-eval (QueryView V1 V2))))
+
+  (test "QueryView with non-symbol third argument throws"
+      '(ErrorWhenEvaluatingExpression (||) "QueryView third argument must be a symbol")
+      (begin
+        (ve-eval (DefineView V1 (Table (A 1))))
+        (ve-eval (QueryView V1 #t 42))))
+
+  (test "QueryView with unknown integrity mode throws"
+      '(ErrorWhenEvaluatingExpression (||) "QueryView unknown integrity mode: UnknownMode")
+      (begin
+        (ve-eval (DefineView V1 (Table (A 1))))
+        (ve-eval (QueryView V1 #t UnknownMode))))
 
   (test "QueryView on unknown view throws"
         '(ErrorWhenEvaluatingExpression (||) "View not found: NONEXISTENT")

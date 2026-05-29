@@ -1,13 +1,21 @@
+// ViewEngine Caching Protocol
+//
+// If views are to be cached and cached results reused by the engine pipeline, every engine in the
+// pipeline must handle the WithCaches top-level operator, the Pending and Borrowed wrapper
+// operators, and the CacheRef operator used to refer to cached views in the expression.
+//
+// Views can be cached by passing true as the second argument to QueryView. If a single QueryView
+// call wants to cache its result, the expression gets wrapped in the WithCaches operators, and
+// inversely if no views are to be cached, the expression is left unchanged.
+
 #pragma once
 
 #include <Expression.hpp>
 #include <ExpressionUtilities.hpp>
 #include <Utilities.hpp>
 
-#include <algorithm>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -16,69 +24,104 @@ using boss::ComplexExpression;
 using boss::Expression;
 using boss::Symbol;
 using boss::utilities::operator""_;
-using boss::expressions::CloneReason;
 
-// An ordered list of (view name, expression) pairs representing view results
-// that need to be cached once the full pipeline has evaluated them.
+enum class CacheEntryType {
+  Borrowed, // Cached value moved out of view registry and moved back in at pipeline end
+  Pending,  // View definition to be cached after evaluation of the full pipeline
+};
+
+// Optional optimisation guideline for engines to follow while connecting their own caching logic to
+// this protocol. Designed to help engines identify when it is safe to use their own cached results
+// for the incoming BOSS expression, instead of reevaluating it. However, engines can always
+// choose to just reevaluate everything as normal. An integrity check is a comparison between the
+// incoming expression and the engine's own cached expression for the same view
 //
-// Ordering is topological by construction: inner/deeper views are registered
-// before outer views that depend on them.
-// This guarantees that when processing entries in order 0..N, any CacheRef
-// referenced by entry[i] will already be resolved by entry[j < i].
-using PendingCacheRegistry = std::vector<std::pair<std::string, Expression>>;
+// 2 modes of integrity checks are supported as options for QueryView calls These options can mean
+// different things to different engines but are designed with BOSS Table expressions in mind.
+//
+// Structural - more lightweight but incorrect when there are operators that modify values inline
+//              while preserving the overall structure of the BOSS table expression
+//              O(num_columns): schema + row count + null counts per column.
+//              100% correct for structural operators (Filter, Project,
+//              GroupBy, Join, ...)
+// Content - hash over the actual content of the expression
+//           O(n): xxHash3_128 over all column data.
+//           Practically 100% correct for everything.  Recommended for
+//           views ending in aggregations where the result is small and hashing is cheap
+enum class IntegrityCheckMode {
+  Structural,
+  Content,
+};
 
-// A mapping from view name to the index of its pending cache in the registry.
-using PendingCacheLookup = std::unordered_map<std::string_view, size_t>;
+struct CacheEntry {
+  Expression value;
+  CacheEntryType type;
+  std::optional<IntegrityCheckMode>
+      integrityMode; // guideline for engines, not a strict requirement
+};
 
-// Default registry and lookup
-// Each engine compiled as a separate .so gets its own independent instances.
-inline PendingCacheRegistry defaultPendingCacheRegistry;
-inline PendingCacheLookup defaultPendingCacheLookup;
+// Registry mapping view names to cache entries. The registry is not about persistance, but
+// per-query tracking, and should be cleared after each query. Entries represent expressions wrapped
+// with Pending/Borrowed and referenced by CacheRef within the the WithCaches expression, which has
+// the following structure:
+// (WithCaches
+//   (Borrowed|Pending viewName1 viewDef1 [integrityMode1])
+//   (Borrowed|Pending viewName2 viewDef2 [integrityMode2])
+//   ...
+//   finalExpr)
+using CacheRegistry = std::unordered_map<std::string, CacheEntry>;
 
-// Helper function for handling the WithPendingCaches operator
-// - populates the provided registry and lookup with the side-channel expressions to be cached
-// - returns only the final expression to be evaluated by the engine
-inline Expression unpackWithPendingCaches(Expression &&expr, PendingCacheRegistry &registry,
-                                          PendingCacheLookup &lookup) {
+// Default registry
+// Each engine compiled as a separate .so gets its own independent instance.
+inline CacheRegistry defaultCacheRegistry;
+
+// Parses a WithCaches expression, populates registry with Borrowed
+// and Pending entries, and returns the actual query (last arg).
+inline Expression unpackWithCaches(Expression &&expr, CacheRegistry &registry) {
   auto [head, statics, dynamics, spans] = std::move(std::get<ComplexExpression>(expr)).decompose();
-  // Dynamics layout: Name0, expr0, Name1, expr1, ..., NameN, exprN, finalExpr
-  // Total args must be odd: 2N side-channel pairs + 1 final
+
   auto const numArgs = dynamics.size();
-  registry.reserve(numArgs / 2);
-  lookup.reserve(numArgs / 2);
-  for (size_t i = 0; i + 1 < numArgs - 1; i += 2) {
-    auto name = std::get<Symbol>(dynamics[i]).getName();
-    registry.emplace_back(std::move(name), std::move(dynamics[i + 1]));
-    lookup.emplace(registry.back().first, registry.size() - 1);
+  registry.reserve(numArgs - 1);
+
+  for (size_t i = 0; i + 1 < numArgs; ++i) {
+    auto [wHead, wStatics, wDynamics, wSpans] =
+        std::move(std::get<ComplexExpression>(dynamics[i])).decompose();
+
+    CacheEntryType type = wHead == "Borrowed"_ ? CacheEntryType::Borrowed : CacheEntryType::Pending;
+
+    auto name = std::get<Symbol>(wDynamics[0]).getName();
+
+    std::optional<IntegrityCheckMode> mode = std::nullopt;
+    if (type == CacheEntryType::Borrowed && wDynamics.size() >= 3) {
+      auto const &modeSym = std::get<Symbol>(wDynamics[2]).getName();
+      mode = modeSym == "Structural" ? IntegrityCheckMode::Structural : IntegrityCheckMode::Content;
+    }
+
+    registry[std::move(name)] = CacheEntry{std::move(wDynamics[1]), type, mode};
   }
+
   return std::move(dynamics[numArgs - 1]);
 }
 
-// Helper function for handling the CacheRef operator
-inline std::optional<Expression> resolveCacheRef(ComplexExpression const &expr,
-                                                 PendingCacheLookup const &lookup,
-                                                 PendingCacheRegistry const &registry) {
-  // TODO: cloning is currently unavoidable — the registry must retain ownership
-  // so that ViewEngine2 can persist all side-channel results at the end of the pipeline.
-  // Worth revisiting whether entries that are guaranteed to not be needed again
-  // downstream could instead be moved out of the registry directly.
-  auto const &name = std::get<Symbol>(expr.getDynamicArguments()[0]).getName();
-  auto it = lookup.find(name);
-  if (it == lookup.end())
-    return std::nullopt;
-
-  return registry[it->second].second.clone(CloneReason::EVALUATE_CONST_EXPRESSION);
-}
-
-// Helper function for re-packing the final expression with the to be cached expressions
-inline Expression repackWithPendingCaches(PendingCacheRegistry &&registry, Expression &&finalExpr) {
+inline Expression repackWithCaches(CacheRegistry &&registry, Expression &&finalExpr) {
   boss::ExpressionArguments args;
-  args.reserve(registry.size() * 2 + 1);
-  std::for_each(std::make_move_iterator(registry.begin()), std::make_move_iterator(registry.end()),
-                [&args](auto &&pair) {
-                  args.emplace_back(Symbol(std::move(pair.first)));
-                  args.emplace_back(std::move(pair.second));
-                });
+  args.reserve(registry.size() + 1);
+
+  for (auto &&[name, entry] : registry) {
+    boss::ExpressionArguments wrapperArgs;
+    auto const &mode = entry.integrityMode;
+    wrapperArgs.reserve(mode ? 3u : 2u);
+    wrapperArgs.emplace_back(Symbol(name));
+    wrapperArgs.emplace_back(std::move(entry.value));
+    if (mode) {
+      wrapperArgs.emplace_back(*mode == IntegrityCheckMode::Structural ? "Structural"_
+                                                                       : "Content"_);
+    }
+
+    Symbol const wrapperHead = entry.type == CacheEntryType::Borrowed ? "Borrowed"_ : "Pending"_;
+    args.emplace_back(ComplexExpression{wrapperHead, {}, std::move(wrapperArgs), {}});
+  }
+
   args.emplace_back(std::move(finalExpr));
-  return ComplexExpression{"WithPendingCaches"_, {}, std::move(args), {}};
+  return ComplexExpression{"WithCaches"_, {}, std::move(args), {}};
 }

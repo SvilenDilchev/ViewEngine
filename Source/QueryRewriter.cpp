@@ -5,7 +5,7 @@
 using boss::expressions::CloneReason;
 
 static std::unordered_set<std::string> sideEffectOperators = {"DefineView", "DropView",
-                                                              "ClearViews", "CacheView"};
+                                                              "ClearViews"};
 
 // TODO: canonicalise serialised predicates (e.g., Equal(a, b) vs Equal(b, a))
 static std::string serializeExpr(const Expression &expr) {
@@ -91,15 +91,20 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
             const auto &dynamics = ce.getDynamicArguments();
 
             if (head == "QueryView"_) {
-              if (dynamics.empty() || dynamics.size() > 2 || !std::get_if<Symbol>(&dynamics[0])) {
-                metadata.sideEffect = true; // Treat malformed QueryView as side effect
+              // Treat malformed QueryView as side effect
+              if (dynamics.empty() || dynamics.size() > 3 || !std::get_if<Symbol>(&dynamics[0])) {
+                metadata.sideEffect = true;
                 return;
               }
-              if (dynamics.size() == 2 && !std::get_if<bool>(&dynamics[1])) {
-                metadata.sideEffect = true; // Second arg must be a boolean if present
+              if (dynamics.size() >= 2 && !std::get_if<bool>(&dynamics[1])) {
+                metadata.sideEffect = true;
                 return;
               }
-              
+              if (dynamics.size() == 3 && !std::get_if<Symbol>(&dynamics[2])) {
+                metadata.sideEffect = true;
+                return;
+              }
+
               const auto &viewName = std::get_if<Symbol>(&dynamics[0])->getName();
               metadata.dependencies.insert(viewName);
               metadata.signature.viewPredicates.try_emplace(viewName);
