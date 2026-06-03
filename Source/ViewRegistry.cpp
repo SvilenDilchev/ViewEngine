@@ -27,6 +27,8 @@ bool hasCycle(const std::string &newView, const std::string &current,
   return false;
 }
 
+// TODO: use the viewToViews reverse dependency index to optimize this instead of brute force
+// scanning all views
 void invalidateDependentCaches(const std::string &invalidatedView,
                                std::unordered_set<std::string> &seen) {
   for (auto &[name, entry] : viewRegistry) {
