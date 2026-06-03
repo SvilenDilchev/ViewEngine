@@ -308,6 +308,10 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
     // TODO: without schema information we cannot verify the view's projections cover
     // everything the query needs — pessimistically reject until schema is available.
     return -1.0;
+  } else if (viewParts.projectedColumns.empty() && !queryParts.projectedColumns.empty()) {
+    // View returns all base columns but query needs specific projected columns.
+    // Without schema info we cannot verify coverage — pessimistically reject.
+    return -1.0;
   }
 
   return W_TABLE * tableCoverage + W_PRED * predicateCoverage + W_JOIN * joinCoverage +
