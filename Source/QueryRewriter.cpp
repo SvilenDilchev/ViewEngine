@@ -8,15 +8,12 @@ using boss::utilities::operator""_;
 static std::unordered_set<boss::Symbol> sideEffectOperators = {"DefineView"_, "DropView"_,
                                                                "ClearViews"_};
 
-static const std::unordered_set<boss::Symbol> rewritableOperators = {"Filter"_, "Join"_, "LeftJoin"_,
-                                                                      "AntiJoin"_, "Project"_};
+static const std::unordered_set<boss::Symbol> rewritableOperators = {
+    "Filter"_, "Join"_, "LeftJoin"_, "AntiJoin"_, "Project"_};
 
 // Map for parsing BOSS symbols into JoinType enum values
 static std::unordered_map<boss::Symbol, JoinType> joinTypeMap = {
-    {"Join"_, JoinType::INNER},
-    {"LeftJoin"_, JoinType::LEFT},
-    {"AntiJoin"_, JoinType::ANTI}
-};
+    {"Join"_, JoinType::INNER}, {"LeftJoin"_, JoinType::LEFT}, {"AntiJoin"_, JoinType::ANTI}};
 
 // TODO: canonicalise serialised predicates (e.g., Equal(a, b) vs Equal(b, a))
 static std::string serializeExpr(const Expression &expr) {
@@ -108,7 +105,7 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
                 return;
               }
 
-              const auto* viewName = std::get_if<Symbol>(&dynamics[0]);
+              const auto *viewName = std::get_if<Symbol>(&dynamics[0]);
               if (!viewName) {
                 metadata.sideEffect = true;
                 return;
@@ -141,12 +138,12 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
                 return;
               }
 
-              const auto* tableName = std::get_if<Symbol>(&dynamics[0]);
+              const auto *tableName = std::get_if<Symbol>(&dynamics[0]);
               if (!tableName) {
                 metadata.sideEffect = true; // Treat malformed ByName as side effect
                 return;
               }
-              
+
               metadata.signature.tablePredicates.try_emplace(*tableName);
               sources.first.insert(*tableName);
               return;
@@ -188,31 +185,53 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
             }
 
             if (auto it = joinTypeMap.find(head); it != joinTypeMap.end()) {
-              if (dynamics.size() < 4) {
+              if (dynamics.size() < 2) {
                 metadata.sideEffect = true; // Treat malformed Joins as side effect
                 return;
               }
 
               JoinType parsedJoinType = it->second;
-
               SourceSets leftSources, rightSources;
               walkView(dynamics[0], metadata, leftSources);
-              walkView(dynamics[2], metadata, rightSources);
+              walkView(dynamics[1], metadata, rightSources);
 
               std::unordered_set<boss::Symbol> allLefts = leftSources.first;
               allLefts.insert(leftSources.second.begin(), leftSources.second.end());
               std::unordered_set<boss::Symbol> allRights = rightSources.first;
               allRights.insert(rightSources.second.begin(), rightSources.second.end());
 
-              metadata.signature.joinEdges.push_back(
-                  {std::move(allLefts), std::move(allRights),
-                   dynamics[1].clone(CloneReason::EXPRESSION_WRAPPING),
-                   dynamics[3].clone(CloneReason::EXPRESSION_WRAPPING), parsedJoinType});
-
               sources.first.merge(leftSources.first);
               sources.first.merge(rightSources.first);
               sources.second.merge(leftSources.second);
               sources.second.merge(rightSources.second);
+
+              boss::ExpressionArguments leftKeysArgs, rightKeysArgs;
+              for (size_t i = 2; i < dynamics.size(); ++i) {
+                const auto *pred = std::get_if<ComplexExpression>(&dynamics[i]);
+                if (pred && pred->getHead() == "Equal"_) {
+                  const auto &args = pred->getDynamicArguments();
+                  // TODO: this assumes equi-join predicates are always Equal(leftKey, rightKey),
+                  // instead use schema information to determine which side each key belongs to.
+                  if (args.size() == 2) {
+                    leftKeysArgs.push_back(args[0].clone(CloneReason::EXPRESSION_WRAPPING));
+                    rightKeysArgs.push_back(args[1].clone(CloneReason::EXPRESSION_WRAPPING));
+                  }
+                } else {
+                  // It is a residual filter (or a boolean literal, etc.): assign to tables
+                  assignPredicateToSources(dynamics[i].clone(CloneReason::EXPRESSION_WRAPPING),
+                                           metadata, sources);
+                }
+              }
+
+              // TODO: before we just had the keys as dynamics[1] and dynamics[3],
+              // this is a patch to not rewrite the serialiser and scorer
+              // but we should properly parse the join keys using schema information
+              Expression leftKeys = ComplexExpression("Keys"_, {}, std::move(leftKeysArgs));
+              Expression rightKeys = ComplexExpression("Keys"_, {}, std::move(rightKeysArgs));
+
+              metadata.signature.joinEdges.push_back({std::move(allLefts), std::move(allRights),
+                                                      std::move(leftKeys), std::move(rightKeys),
+                                                      parsedJoinType});
               return;
             }
 
