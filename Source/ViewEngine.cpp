@@ -1,5 +1,5 @@
 #include "CachingProtocol.hpp"
-#include "MetadataStore.hpp"
+#include "MetadataRegistry.hpp"
 #include "ViewRegistry.hpp"
 
 using boss::expressions::CloneReason;
