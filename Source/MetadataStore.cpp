@@ -1,5 +1,6 @@
 #include "MetadataStore.hpp"
 #include <ExpressionUtilities.hpp>
+#include <algorithm>
 
 using boss::utilities::operator""_;
 

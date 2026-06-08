@@ -33,8 +33,8 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
               auto *name = std::get_if<Symbol>(&dynamics[0]);
               if (!name)
                 return Expression(false); // DefineView requires a symbol for the view name
+              auto viewName = std::move(*name);
 
-              auto viewName = name->getName();
               ViewMetadata metadata;
               SourceSets sources;
               walkView(dynamics[1], metadata,
@@ -45,13 +45,13 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
                 // Block if definition has side effects such as defining or dropping views
                 return Expression(false);
 
-              std::unordered_set<std::string> visited;
+              std::unordered_set<boss::Symbol> visited;
               for (const auto &dep : metadata.dependencies) {
                 if (hasCycle(viewName, dep, visited))
                   return Expression(false); // Block if definition creates a cycle
               }
 
-              std::unordered_set<std::string> seen;
+              std::unordered_set<boss::Symbol> seen;
               invalidateDependentCaches(viewName, seen);
 
               // Remove old index entries if view already exists
@@ -68,7 +68,7 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
               for (const auto &dep : metadata.dependencies)
                 viewToViews[dep].insert(viewName);
 
-              viewRegistry[viewName] =
+              viewRegistry[std::move(viewName)] =
                   ViewEntry{std::nullopt, std::move(dynamics[1]), std::move(metadata.dependencies),
                             std::move(metadata.signature)};
 
@@ -93,26 +93,26 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
 
               std::optional<IntegrityCheckMode> integrityMode = std::nullopt;
               if (dynamics.size() == 3) {
-                auto *modeSym = std::get_if<Symbol>(&dynamics[2]);
-                if (!modeSym)
+                auto *mode = std::get_if<Symbol>(&dynamics[2]);
+                if (!mode)
                   throw std::runtime_error("QueryView third argument must be a symbol");
 
-                auto const &modeStr = modeSym->getName();
-                if (modeStr == "Structural")
+                if (*mode == "Structural"_)
                   integrityMode = IntegrityCheckMode::Structural;
-                else if (modeStr == "Content")
+                else if (*mode == "Content"_)
                   integrityMode = IntegrityCheckMode::Content;
                 else
-                  throw std::runtime_error("QueryView unknown integrity mode: " + modeStr);
+                  throw std::runtime_error("QueryView unknown integrity mode: " + mode->getName());
               }
 
-              auto viewName = name->getName();
+              auto viewName = std::move(*name);
               auto it = viewRegistry.find(viewName);
               if (it == viewRegistry.end())
-                throw std::runtime_error("View not found: " + name->getName());
+                throw std::runtime_error("View not found: " + viewName.getName());
 
               if (evaluationStack.count(viewName))
-                throw std::runtime_error("Circular view dependency detected: " + viewName);
+                throw std::runtime_error("Circular view dependency detected: " +
+                                         viewName.getName());
 
               ViewEntry &entry = it->second;
 
@@ -120,7 +120,7 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
               // and move back in at the second pass of ViewEngine in the pipelines
               if (entry.cached) {
                 boss::ExpressionArguments cacheRefArgs;
-                cacheRefArgs.emplace_back(Symbol(viewName));
+                cacheRefArgs.emplace_back(viewName);
                 cacheRefArgs.emplace_back("Borrowed"_);
                 if (defaultCacheRegistry.count(viewName)) {
                   return Expression(
@@ -136,7 +136,7 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
 
               evaluationStack.insert(viewName);
               struct EvaluationGuard { // RAII guard for evaluation stack cleanup
-                std::string viewName;
+                boss::Symbol viewName;
                 ~EvaluationGuard() { evaluationStack.erase(viewName); }
               } guard{viewName};
 
@@ -158,7 +158,7 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
               }
 
               boss::ExpressionArguments cacheRefArgs;
-              cacheRefArgs.emplace_back(Symbol(viewName));
+              cacheRefArgs.emplace_back(viewName);
               cacheRefArgs.emplace_back("Pending"_);
               return Expression(ComplexExpression("CacheRef"_, {}, std::move(cacheRefArgs), {}));
             }
@@ -176,7 +176,8 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
               for (auto &[name, entry] : defaultCacheRegistry) {
                 auto it = viewRegistry.find(name);
                 if (it == viewRegistry.end())
-                  throw std::runtime_error("View not found for caching in WithCaches: " + name);
+                  throw std::runtime_error("View not found for caching in WithCaches: " +
+                                           name.getName());
 
                 if (!it->second.cached)
                   it->second.cached = evaluate(std::move(entry.value), true);
@@ -200,18 +201,18 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
               if (!std::get_if<Symbol>(&dynamics[1]))
                 throw std::runtime_error("CacheRef second argument must be a symbol");
 
-              auto viewName = name->getName();
+              auto viewName = std::move(*name);
               auto it = viewRegistry.find(viewName);
               if (it == viewRegistry.end())
                 throw std::runtime_error("CacheRef could not be resolved, view not found: " +
-                                         viewName);
+                                         viewName.getName());
 
               if (!it->second.cached) {
                 auto regIt = defaultCacheRegistry.find(viewName);
                 if (regIt == defaultCacheRegistry.end())
                   throw std::runtime_error(
                       "CacheRef could not be resolved, entry not found in cache registry: " +
-                      viewName);
+                      viewName.getName());
                 it->second.cached = evaluate(std::move(regIt->second.value), true);
               }
 
@@ -230,14 +231,15 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
               if (!name)
                 return Expression(false); // DropView requires a symbol argument for the view name
 
-              auto viewName = name->getName();
+              auto viewName = std::move(*name);
               if (evaluationStack.count(viewName))
-                throw std::runtime_error("Cannot drop view currently being evaluated: " + viewName);
+                throw std::runtime_error("Cannot drop view currently being evaluated: " +
+                                         viewName.getName());
 
               if (auto it = viewToViews.find(viewName);
                   it != viewToViews.end() && !it->second.empty())
-                throw std::runtime_error("Cannot drop view " + viewName + ": " +
-                                         *it->second.begin() + " depends on it");
+                throw std::runtime_error("Cannot drop view " + viewName.getName() + ": " +
+                                         it->second.begin()->getName() + " depends on it");
 
               auto it = viewRegistry.find(viewName);
               if (it == viewRegistry.end())
@@ -263,7 +265,7 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
               if (!evaluationStack.empty())
                 throw std::runtime_error(
                     "Cannot clear views while " + std::to_string(evaluationStack.size()) +
-                    " view(s) are being evaluated, e.g.: " + *evaluationStack.begin());
+                    " view(s) are being evaluated, e.g., " + evaluationStack.begin()->getName());
 
               viewRegistry.clear();
               tableToViews.clear();
@@ -276,17 +278,18 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
                 throw std::runtime_error("ListViews does not take any arguments");
 
               // Sort views for deterministic output
-              std::vector<std::pair<std::string, const ViewEntry *>> sortedViews;
+              std::vector<std::pair<boss::Symbol, const ViewEntry *>> sortedViews;
               sortedViews.reserve(viewRegistry.size());
               for (const auto &[name, expr] : viewRegistry)
                 sortedViews.emplace_back(name, &expr);
-              std::sort(sortedViews.begin(), sortedViews.end(),
-                        [](const auto &a, const auto &b) { return a.first < b.first; });
+              std::sort(sortedViews.begin(), sortedViews.end(), [](const auto &a, const auto &b) {
+                return a.first.getName() < b.first.getName();
+              });
 
               boss::ExpressionArguments nameArgs;
               boss::ExpressionArguments defArgs;
               for (const auto &[name, entry] : sortedViews) {
-                nameArgs.emplace_back(Symbol(name));
+                nameArgs.emplace_back(name);
                 defArgs.emplace_back(entry->definition.clone(CloneReason::EXPRESSION_WRAPPING));
               }
 
@@ -320,14 +323,15 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
                 return Expression(false);
 
               std::vector<boss::Symbol> columns;
+              columns.reserve(dynamics.size() - 4);
               for (size_t i = 4; i < dynamics.size(); ++i) {
                 auto *col = std::get_if<Symbol>(&dynamics[i]);
                 if (!col)
                   return Expression(false);
-                columns.push_back(*col);
+                columns.push_back(std::move(*col));
               }
 
-              return Expression(registerTable(*name, *url, *loaderPath, *lazy, columns));
+              return Expression(registerTable(std::move(*name), std::move(*url), std::move(*loaderPath), *lazy, std::move(columns)));
             }
 
             if (head == "DropTable"_) {

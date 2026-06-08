@@ -2,13 +2,13 @@
 
 #include <stack>
 
-std::unordered_map<std::string, ViewEntry> viewRegistry;
-std::unordered_set<std::string> evaluationStack;
-std::unordered_map<std::string, std::unordered_set<std::string>> tableToViews;
-std::unordered_map<std::string, std::unordered_set<std::string>> viewToViews;
+std::unordered_map<boss::Symbol, ViewEntry> viewRegistry;
+std::unordered_set<boss::Symbol> evaluationStack;
+std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> tableToViews;
+std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> viewToViews;
 
-bool hasCycle(const std::string &newView, const std::string &current,
-              std::unordered_set<std::string> &visited) {
+bool hasCycle(const boss::Symbol &newView, const boss::Symbol &current,
+              std::unordered_set<boss::Symbol> &visited) {
   if (current == newView)
     return true;
 
@@ -29,8 +29,8 @@ bool hasCycle(const std::string &newView, const std::string &current,
 
 // TODO: use the viewToViews reverse dependency index to optimize this instead of brute force
 // scanning all views
-void invalidateDependentCaches(const std::string &invalidatedView,
-                               std::unordered_set<std::string> &seen) {
+void invalidateDependentCaches(const boss::Symbol &invalidatedView,
+                               std::unordered_set<boss::Symbol> &seen) {
   for (auto &[name, entry] : viewRegistry) {
     if (seen.count(name))
       continue;
@@ -42,11 +42,11 @@ void invalidateDependentCaches(const std::string &invalidatedView,
   }
 }
 
-void findCandidateViews(const std::unordered_set<std::string> &tables,
-                        std::unordered_set<std::string> &candidates) {
+void findCandidateViews(const std::unordered_set<boss::Symbol> &tables,
+                        std::unordered_set<boss::Symbol> &candidates) {
 
-  std::stack<std::string> toVisit;
-  std::unordered_set<std::string> expanded;
+  std::stack<boss::Symbol> toVisit;
+  std::unordered_set<boss::Symbol> expanded;
 
   // Add direct candidates based on table index
   for (const auto &table : tables)

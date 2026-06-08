@@ -3,9 +3,20 @@
 #include <unordered_set>
 
 using boss::expressions::CloneReason;
+using boss::utilities::operator""_;
 
-static std::unordered_set<std::string> sideEffectOperators = {"DefineView", "DropView",
-                                                              "ClearViews"};
+static std::unordered_set<boss::Symbol> sideEffectOperators = {"DefineView"_, "DropView"_,
+                                                               "ClearViews"_};
+
+static const std::unordered_set<boss::Symbol> rewritableOperators = {"Filter"_, "Join"_, "LeftJoin"_,
+                                                                      "AntiJoin"_, "Project"_};
+
+// Map for parsing BOSS symbols into JoinType enum values
+static std::unordered_map<boss::Symbol, JoinType> joinTypeMap = {
+    {"Join"_, JoinType::INNER},
+    {"LeftJoin"_, JoinType::LEFT},
+    {"AntiJoin"_, JoinType::ANTI}
+};
 
 // TODO: canonicalise serialised predicates (e.g., Equal(a, b) vs Equal(b, a))
 static std::string serializeExpr(const Expression &expr) {
@@ -36,7 +47,7 @@ static void flattenPredicates(Expression &&pred, std::vector<Expression> &out, b
                      for (auto &arg : dynamics)
                        flattenPredicates(std::move(arg), out, sideEffect);
                    } else {
-                     if (sideEffectOperators.count(head.getName())) {
+                     if (sideEffectOperators.count(head)) {
                        sideEffect = true;
                        return; // Block side effect operators in predicates
                      }
@@ -66,7 +77,7 @@ static void assignPredicateToSources(Expression &&pred, ViewMetadata &metadata,
 // Checks if a view join predicate is non-destructive with respect to
 // the information that the query is interested in
 static bool isSafeUnmatchedJoin(const JoinEdge &viewEdge, const Signature &queryParts) {
-  if (viewEdge.joinType != "LeftJoin" && viewEdge.joinType != "AntiJoin")
+  if (viewEdge.joinType != JoinType::LEFT && viewEdge.joinType != JoinType::ANTI)
     return false; // If join is destructive on both sides (e.g., Inner Join)
 
   for (const auto &src : viewEdge.rightSources) {
@@ -92,10 +103,17 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
 
             if (head == "QueryView"_) {
               // Treat malformed QueryView as side effect
-              if (dynamics.empty() || dynamics.size() > 3 || !std::get_if<Symbol>(&dynamics[0])) {
+              if (dynamics.empty() || dynamics.size() > 3) {
                 metadata.sideEffect = true;
                 return;
               }
+
+              const auto* viewName = std::get_if<Symbol>(&dynamics[0]);
+              if (!viewName) {
+                metadata.sideEffect = true;
+                return;
+              }
+
               if (dynamics.size() >= 2 && !std::get_if<bool>(&dynamics[1])) {
                 metadata.sideEffect = true;
                 return;
@@ -105,27 +123,32 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
                 return;
               }
 
-              const auto &viewName = std::get_if<Symbol>(&dynamics[0])->getName();
-              metadata.dependencies.insert(viewName);
-              metadata.signature.viewPredicates.try_emplace(viewName);
-              sources.second.insert(viewName);
+              metadata.dependencies.insert(*viewName);
+              metadata.signature.viewPredicates.try_emplace(*viewName);
+              sources.second.insert(*viewName);
               return;
             }
 
             // Detect side prohibited effects
-            if (sideEffectOperators.count(head.getName())) {
+            if (sideEffectOperators.count(head)) {
               metadata.sideEffect = true;
               return;
             }
 
             if (head == "ByName"_) {
-              if (dynamics.empty() || !std::get_if<Symbol>(&dynamics[0])) {
-                metadata.sideEffect = true; // Treat malformed ByName as side effect since
+              if (dynamics.empty()) {
+                metadata.sideEffect = true;
                 return;
               }
-              const auto &viewName = std::get_if<Symbol>(&dynamics[0])->getName();
-              metadata.signature.tablePredicates.try_emplace(viewName);
-              sources.first.insert(viewName);
+
+              const auto* tableName = std::get_if<Symbol>(&dynamics[0]);
+              if (!tableName) {
+                metadata.sideEffect = true; // Treat malformed ByName as side effect
+                return;
+              }
+              
+              metadata.signature.tablePredicates.try_emplace(*tableName);
+              sources.first.insert(*tableName);
               return;
             }
 
@@ -164,25 +187,27 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
               return;
             }
 
-            if (head == "Join"_ || head == "LeftJoin"_ || head == "AntiJoin"_) {
+            if (auto it = joinTypeMap.find(head); it != joinTypeMap.end()) {
               if (dynamics.size() < 4) {
                 metadata.sideEffect = true; // Treat malformed Joins as side effect
                 return;
               }
 
+              JoinType parsedJoinType = it->second;
+
               SourceSets leftSources, rightSources;
               walkView(dynamics[0], metadata, leftSources);
               walkView(dynamics[2], metadata, rightSources);
 
-              std::unordered_set<std::string> allLefts = leftSources.first;
+              std::unordered_set<boss::Symbol> allLefts = leftSources.first;
               allLefts.insert(leftSources.second.begin(), leftSources.second.end());
-              std::unordered_set<std::string> allRights = rightSources.first;
+              std::unordered_set<boss::Symbol> allRights = rightSources.first;
               allRights.insert(rightSources.second.begin(), rightSources.second.end());
 
               metadata.signature.joinEdges.push_back(
                   {std::move(allLefts), std::move(allRights),
                    dynamics[1].clone(CloneReason::EXPRESSION_WRAPPING),
-                   dynamics[3].clone(CloneReason::EXPRESSION_WRAPPING), head.getName()});
+                   dynamics[3].clone(CloneReason::EXPRESSION_WRAPPING), parsedJoinType});
 
               sources.first.merge(leftSources.first);
               sources.first.merge(rightSources.first);
@@ -318,13 +343,10 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
          W_PROJ * projectionCoverage;
 }
 
-std::optional<std::string> findRewriting(const Expression &query) {
-  static const std::unordered_set<std::string> rewritableOperators = {"Filter", "Join", "LeftJoin",
-                                                                      "AntiJoin", "Project"};
-
+std::optional<boss::Symbol> findRewriting(const Expression &query) {
   // Only attempt rewriting if the top-level operator is one we support rewriting for
   auto *ce = std::get_if<ComplexExpression>(&query);
-  if (!ce || !rewritableOperators.count(ce->getHead().getName()))
+  if (!ce || !rewritableOperators.count(ce->getHead()))
     return std::nullopt;
 
   // Step 1: extract query signature
@@ -336,7 +358,7 @@ std::optional<std::string> findRewriting(const Expression &query) {
     return std::nullopt;
 
   // Step 2: find candidate views
-  std::unordered_set<std::string> candidates;
+  std::unordered_set<boss::Symbol> candidates;
   findCandidateViews(querySources.first, candidates);
 
   if (candidates.empty())

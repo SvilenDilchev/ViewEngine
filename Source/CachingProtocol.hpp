@@ -15,7 +15,6 @@
 #include <Utilities.hpp>
 
 #include <optional>
-#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -68,7 +67,7 @@ struct CacheEntry {
 //   (Borrowed|Pending viewName2 viewDef2 [integrityMode2])
 //   ...
 //   finalExpr)
-using CacheRegistry = std::unordered_map<std::string, CacheEntry>;
+using CacheRegistry = std::unordered_map<boss::Symbol, CacheEntry>;
 
 // Default registry
 // Each engine compiled as a separate .so gets its own independent instance.
@@ -90,12 +89,12 @@ inline Expression unpackWithCaches(Expression &&expr, CacheRegistry &registry) {
 
     CacheEntryType type = wHead == "Borrowed"_ ? CacheEntryType::Borrowed : CacheEntryType::Pending;
 
-    auto name = std::get<Symbol>(wDynamics[0]).getName();
+    auto name = std::get<Symbol>(std::move(wDynamics[0]));
 
     std::optional<IntegrityCheckMode> mode = std::nullopt;
     if (type == CacheEntryType::Borrowed && wDynamics.size() >= 3) {
-      auto const &modeSym = std::get<Symbol>(wDynamics[2]).getName();
-      mode = modeSym == "Structural" ? IntegrityCheckMode::Structural : IntegrityCheckMode::Content;
+      auto const &modeSym = std::get<Symbol>(wDynamics[2]);
+      mode = modeSym == "Structural"_ ? IntegrityCheckMode::Structural : IntegrityCheckMode::Content;
     }
 
     registry[std::move(name)] = CacheEntry{std::move(wDynamics[1]), type, mode};
@@ -114,7 +113,7 @@ inline Expression repackWithCaches(CacheRegistry &&registry, Expression &&finalE
     boss::ExpressionArguments wrapperArgs;
     auto const &mode = entry.integrityMode;
     wrapperArgs.reserve(mode ? 3u : 2u);
-    wrapperArgs.emplace_back(Symbol(name));
+    wrapperArgs.emplace_back(name);
     wrapperArgs.emplace_back(std::move(entry.value));
     if (mode) {
       wrapperArgs.emplace_back(*mode == IntegrityCheckMode::Structural ? "Structural"_

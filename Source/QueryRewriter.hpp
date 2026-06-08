@@ -22,24 +22,26 @@ constexpr double W_JOIN = 0.30;
 constexpr double W_PRED = 0.20;
 constexpr double W_PROJ = 0.10;
 
+enum class JoinType { INNER, LEFT, ANTI };
+
 // Data structure to represent join relationships between sources in a query, used for rewriting
 struct JoinEdge {
-  std::unordered_set<std::string> leftSources;
-  std::unordered_set<std::string> rightSources;
+  std::unordered_set<boss::Symbol> leftSources;
+  std::unordered_set<boss::Symbol> rightSources;
   Expression leftKeys;
   Expression rightKeys;
-  std::string joinType; // "Join", "LeftJoin", "AntiJoin"
+  JoinType joinType; // "Join", "LeftJoin", "AntiJoin"
 };
 
 struct Signature {
   // Map of base table name to the predicates that apply to it,
   // which are stored as a serialised string key to the actual expression
-  std::unordered_map<std::string, std::unordered_map<std::string, std::shared_ptr<Expression>>>
+  std::unordered_map<boss::Symbol, std::unordered_map<std::string, std::shared_ptr<Expression>>>
       tablePredicates;
   // Map of view names to the predicates that apply to them
   // Views are kept opaque at walking stage and at comparison stage
   // are either expanded or directly compared based on whether the view is materialised
-  std::unordered_map<std::string, std::unordered_map<std::string, std::shared_ptr<Expression>>>
+  std::unordered_map<boss::Symbol, std::unordered_map<std::string, std::shared_ptr<Expression>>>
       viewPredicates;
   // Map of projected column names across the entire query
   std::unordered_map<std::string, std::shared_ptr<Expression>> projectedColumns;
@@ -49,14 +51,14 @@ struct Signature {
 
 // Query sources tracked during walking bottom down for predicate assignments
 // Sources are <tables names and view names>
-using SourceSets = std::pair<std::unordered_set<std::string>, std::unordered_set<std::string>>;
+using SourceSets = std::pair<std::unordered_set<boss::Symbol>, std::unordered_set<boss::Symbol>>;
 
 // Metadata collected during expression tree walking
 // - dependencies: view names referenced via QueryView
 // - sideEffect: true if the definition contains prohibited operations
 // - signature: tables, predicates, projections, and joins found in the expression
 struct ViewMetadata {
-  std::unordered_set<std::string> dependencies;
+  std::unordered_set<boss::Symbol> dependencies;
   bool sideEffect = false;
   Signature signature;
 };
@@ -73,4 +75,4 @@ double scoreView(const Signature &viewParts, const Signature &queryParts);
 
 // Return the best scoring view for the given query, or nullopt if no rewriting is possible
 // Currently only returns a perfect match (score of 1.0)
-std::optional<std::string> findRewriting(const Expression &query);
+std::optional<boss::Symbol> findRewriting(const Expression &query);
