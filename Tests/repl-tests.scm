@@ -1,13 +1,11 @@
-(import (scheme base)
-        (chibi test)
-        (BOSS))
+(import (chibi test))
 
 (define-syntax ve-eval
   (syntax-rules ()
     ((ve-eval query)
      (boss-eval (EvaluateInEngines
-       (List "/mnt/apps/lazy-loading/ViewEngine/build/libViewEngine.so"
-             "/mnt/apps/lazy-loading/ViewEngine/build/libViewEngine.so")
+       (List "build/libViewEngine.so"
+             "build/libViewEngine.so")
        query)))))
 
 
@@ -416,3 +414,275 @@
           (ve-eval (ClearViews))
           (ve-eval (DefineView LIST7 (QueryView SOMEOTHER)))
           (ve-eval (ListViews)))))
+
+
+(test-group "RegisterTable"
+
+  (test "RegisterTable returns true (eager)"
+        #t
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable rt_orders "/data/orders.tbl" "/lib/loader.so" #f rt_orderkey rt_custkey))))
+
+  (test "RegisterTable returns true (lazy)"
+        #t
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable rt_lineitem "/data/lineitem.tbl" "/lib/loader.so" #t rt_l_orderkey rt_l_partkey))))
+
+  (test "RegisterTable with zero columns returns true"
+        #t
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable rt_nocols "/data/nocols.tbl" "/lib/loader.so" #f))))
+
+  (test "RegisterTable duplicate name returns false"
+        #f
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable rt_dup "/data/dup.tbl" "/lib/loader.so" #f rt_dup_col))
+          (ve-eval (RegisterTable rt_dup "/data/dup2.tbl" "/lib/loader.so" #f rt_dup_col2))))
+
+  (test "RegisterTable with fewer than 4 arguments returns false"
+        #f
+        (ve-eval (RegisterTable rt_short "/data/x.tbl" "/lib/loader.so")))
+
+  (test "RegisterTable with no arguments returns false"
+        #f
+        (ve-eval (RegisterTable)))
+
+  (test "RegisterTable with integer name returns false"
+        #f
+        (ve-eval (RegisterTable 123 "/data/x.tbl" "/lib/loader.so" #f)))
+
+  (test "RegisterTable with integer url returns false"
+        #f
+        (ve-eval (RegisterTable rt_int_url 42 "/lib/loader.so" #f)))
+
+  (test "RegisterTable with integer loaderPath returns false"
+        #f
+        (ve-eval (RegisterTable rt_int_loader "/data/x.tbl" 99 #f)))
+
+  (test "RegisterTable with integer lazy returns false"
+        #f
+        (ve-eval (RegisterTable rt_int_lazy "/data/x.tbl" "/lib/loader.so" 1)))
+
+  (test "RegisterTable with integer column returns false"
+        #f
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable rt_int_col "/data/x.tbl" "/lib/loader.so" #f 123))))
+
+  (test "RegisterTable column name conflicts with existing table name returns false"
+        #f
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable rt_base "/data/base.tbl" "/lib/loader.so" #f rt_base_col))
+          (ve-eval (RegisterTable rt_other "/data/other.tbl" "/lib/loader.so" #f rt_base))))
+
+  (test "RegisterTable name conflicts with existing column name returns false"
+        #f
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable rt_col_owner "/data/owner.tbl" "/lib/loader.so" #f rt_shared_col))
+          (ve-eval (RegisterTable rt_shared_col "/data/shared.tbl" "/lib/loader.so" #f rt_other_col))))
+
+  (test "RegisterTable not at top level returns false"
+        #f
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (DefineView RT_NESTED_VIEW (RegisterTable rt_nested "/data/x.tbl" "/lib/loader.so" #f rt_nested_col)))
+          (ve-eval (QueryView RT_NESTED_VIEW)))))
+
+
+(test-group "DropTable"
+
+  (test "DropTable returns true on success"
+        #t
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable dt_tbl "/data/dt.tbl" "/lib/loader.so" #f dt_col))
+          (ve-eval (DropTable dt_tbl))))
+
+  (test "DropTable on non-existent table returns false"
+        #f
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (DropTable dt_nonexistent))))
+
+  (test "DropTable with no arguments returns false"
+        #f
+        (ve-eval (DropTable)))
+
+  (test "DropTable with too many arguments returns false"
+        #f
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable dt_a "/data/a.tbl" "/lib/loader.so" #f dt_col_a))
+          (ve-eval (RegisterTable dt_b "/data/b.tbl" "/lib/loader.so" #f dt_col_b))
+          (ve-eval (DropTable dt_a dt_b))))
+
+  (test "DropTable with integer argument returns false"
+        #f
+        (ve-eval (DropTable 123)))
+
+  (test "DropTable removes table from registry"
+        '(TableList (Name) (URL) (LoaderPath) (Columns))
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable dt_rem "/data/rem.tbl" "/lib/loader.so" #f dt_rem_col))
+          (ve-eval (DropTable dt_rem))
+          (ve-eval (ListTables))))
+
+  (test "DropTable frees column name for reuse by another table"
+        #t
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable dt_free_owner "/data/x.tbl" "/lib/loader.so" #f dt_shared_col))
+          (ve-eval (DropTable dt_free_owner))
+          (ve-eval (RegisterTable dt_free_reuser "/data/y.tbl" "/lib/loader.so" #f dt_shared_col))))
+
+  (test "DropTable frees table name for reregistration"
+        #t
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable dt_reuse "/data/x.tbl" "/lib/loader.so" #f dt_reuse_col))
+          (ve-eval (DropTable dt_reuse))
+          (ve-eval (RegisterTable dt_reuse "/data/y.tbl" "/lib/loader.so" #f dt_reuse_col))))
+
+  (test "DropTable not at top level returns false"
+        #f
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable dt_toplevel "/data/x.tbl" "/lib/loader.so" #f dt_toplevel_col))
+          (ve-eval (DefineView DT_NESTED_VIEW (DropTable dt_toplevel)))
+          (ve-eval (QueryView DT_NESTED_VIEW)))))
+
+
+(test-group "ClearTables"
+
+  (test "ClearTables returns true"
+        #t
+        (ve-eval (ClearTables)))
+
+  (test "ClearTables with arguments returns false"
+        #f
+        (ve-eval (ClearTables ct_extra)))
+
+  (test "ClearTables removes all tables"
+        '(TableList (Name) (URL) (LoaderPath) (Columns))
+        (begin
+          (ve-eval (RegisterTable ct_a "/data/a.tbl" "/lib/loader.so" #f ct_col_a))
+          (ve-eval (RegisterTable ct_b "/data/b.tbl" "/lib/loader.so" #f ct_col_b))
+          (ve-eval (ClearTables))
+          (ve-eval (ListTables))))
+
+  (test "ClearTables is idempotent on empty registry"
+        #t
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (ClearTables))))
+
+  (test "ClearTables not at top level returns false"
+        #f
+        (begin
+          (ve-eval (DefineView CT_NESTED_VIEW (ClearTables)))
+          (ve-eval (QueryView CT_NESTED_VIEW)))))
+
+
+(test-group "ListTables"
+
+  (test "ListTables with arguments throws"
+        '(ErrorWhenEvaluatingExpression (||) "ListTables does not take any arguments")
+        (ve-eval (ListTables lt_extra)))
+
+  (test "ListTables on empty registry returns empty TableList"
+        '(TableList (Name) (URL) (LoaderPath) (Columns))
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (ListTables))))
+
+  (test "ListTables returns single table"
+        '(TableList (Name lt_orders) (URL "/data/orders.tbl") (LoaderPath "/lib/loader.so") (Columns (List lt_orderkey lt_custkey)))
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable lt_orders "/data/orders.tbl" "/lib/loader.so" #t lt_orderkey lt_custkey))
+          (ve-eval (ListTables))))
+
+  (test "ListTables returns multiple tables sorted alphabetically"
+        '(TableList (Name lt_aaa lt_zzz) (URL "/data/aaa.tbl" "/data/zzz.tbl") (LoaderPath "/lib/loader.so" "/lib/loader.so") (Columns (List lt_col1) (List lt_col2)))
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable lt_zzz "/data/zzz.tbl" "/lib/loader.so" #f lt_col2))
+          (ve-eval (RegisterTable lt_aaa "/data/aaa.tbl" "/lib/loader.so" #f lt_col1))
+          (ve-eval (ListTables))))
+
+  (test "ListTables reflects dropped table"
+        '(TableList (Name lt_keep) (URL "/data/keep.tbl") (LoaderPath "/lib/loader.so") (Columns (List lt_keep_col)))
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable lt_keep "/data/keep.tbl" "/lib/loader.so" #f lt_keep_col))
+          (ve-eval (RegisterTable lt_gone "/data/gone.tbl" "/lib/loader.so" #f lt_gone_col))
+          (ve-eval (DropTable lt_gone))
+          (ve-eval (ListTables))))
+
+  (test "ListTables shows both lazy and eager tables"
+        '(TableList (Name lt_eager lt_lazy) (URL "/data/eager.tbl" "/data/lazy.tbl") (LoaderPath "/lib/loader.so" "/lib/loader.so") (Columns (List lt_eager_col) (List lt_lazy_col)))
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable lt_lazy "/data/lazy.tbl" "/lib/loader.so" #t lt_lazy_col))
+          (ve-eval (RegisterTable lt_eager "/data/eager.tbl" "/lib/loader.so" #f lt_eager_col))
+          (ve-eval (ListTables)))))
+
+
+(test-group "Symbol substitution"
+
+  (test "Lazy table symbol rewrites to Gather"
+        '(Gather "/data/sub_lazy.tbl" "/lib/loader.so" (Table) (List sub_col_a sub_col_b))
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable sub_lazy "/data/sub_lazy.tbl" "/lib/loader.so" #t sub_col_a sub_col_b))
+          (ve-eval sub_lazy)))
+
+  (test "Eager table symbol passes through unchanged"
+        'sub_eager
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable sub_eager "/data/sub_eager.tbl" "/lib/loader.so" #f sub_eager_col))
+          (ve-eval sub_eager)))
+
+  (test "Unregistered symbol passes through unchanged"
+        'sub_unknown
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval sub_unknown)))
+
+  (test "Lazy table symbol inside expression gets rewritten"
+        '(Filter (Gather "/data/sub_filter.tbl" "/lib/loader.so" (Table) (List sub_filter_col)) (Greater sub_filter_col 5))
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable sub_filter "/data/sub_filter.tbl" "/lib/loader.so" #t sub_filter_col))
+          (ve-eval (Filter sub_filter (Greater sub_filter_col 5)))))
+
+  (test "Eager table symbol inside expression passes through unchanged"
+        '(Filter sub_eager2 (Greater sub_eager2_col 5))
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable sub_eager2 "/data/sub_eager2.tbl" "/lib/loader.so" #f sub_eager2_col))
+          (ve-eval (Filter sub_eager2 (Greater sub_eager2_col 5)))))
+
+  (test "After DropTable lazy symbol no longer rewritten"
+        'sub_dropped
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable sub_dropped "/data/sub_dropped.tbl" "/lib/loader.so" #t sub_dropped_col))
+          (ve-eval (DropTable sub_dropped))
+          (ve-eval sub_dropped)))
+
+  (test "After ClearTables lazy symbol no longer rewritten"
+        'sub_cleared
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable sub_cleared "/data/sub_cleared.tbl" "/lib/loader.so" #t sub_cleared_col))
+          (ve-eval (ClearTables))
+          (ve-eval sub_cleared))))

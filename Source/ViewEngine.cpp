@@ -1,4 +1,5 @@
 #include "CachingProtocol.hpp"
+#include "MetadataStore.hpp"
 #include "ViewRegistry.hpp"
 
 using boss::expressions::CloneReason;
@@ -295,10 +296,76 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
               return Expression(ComplexExpression("ViewList"_, {}, std::move(columns), {}));
             }
 
+            if (head == "RegisterTable"_) {
+              if (!topLevel)
+                return Expression(false);
+
+              if (dynamics.size() < 4)
+                return Expression(false); // name, url, loaderPath, lazy required at minimum
+
+              auto *name = std::get_if<Symbol>(&dynamics[0]);
+              if (!name)
+                return Expression(false);
+
+              auto *url = std::get_if<std::string>(&dynamics[1]);
+              if (!url)
+                return Expression(false);
+
+              auto *loaderPath = std::get_if<std::string>(&dynamics[2]);
+              if (!loaderPath)
+                return Expression(false);
+
+              auto *lazy = std::get_if<bool>(&dynamics[3]);
+              if (!lazy)
+                return Expression(false);
+
+              std::vector<boss::Symbol> columns;
+              for (size_t i = 4; i < dynamics.size(); ++i) {
+                auto *col = std::get_if<Symbol>(&dynamics[i]);
+                if (!col)
+                  return Expression(false);
+                columns.push_back(*col);
+              }
+
+              return Expression(registerTable(*name, *url, *loaderPath, *lazy, columns));
+            }
+
+            if (head == "DropTable"_) {
+              if (!topLevel)
+                return Expression(false);
+
+              if (dynamics.size() != 1)
+                return Expression(false);
+
+              auto *name = std::get_if<Symbol>(&dynamics[0]);
+              if (!name)
+                return Expression(false);
+
+              return Expression(dropTable(*name));
+            }
+
+            if (head == "ClearTables"_) {
+              if (!topLevel)
+                return Expression(false);
+
+              if (!dynamics.empty())
+                return Expression(false);
+
+              clearTables();
+              return Expression(true);
+            }
+
+            if (head == "ListTables"_) {
+              if (!dynamics.empty())
+                throw std::runtime_error("ListTables does not take any arguments");
+
+              return listTables();
+            }
+
             // Recursively evaluate arguments of other expressions
-            // Do not eval args for ViewList to preserve view definitions for output
+            // Do not eval args to preserve definitions for output
             // Check is here to block eval on second pass through ViewEngine in pipeline
-            if (head != "ViewList"_) {
+            if (head != "ViewList"_ && head != "TableList"_) {
               for (auto &arg : dynamics) {
                 arg = evaluate(std::move(arg), skipRewrite);
               }
@@ -306,6 +373,25 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
 
             return Expression(ComplexExpression(std::move(head), std::move(statics),
                                                 std::move(dynamics), std::move(spans)));
+          },
+          [](Symbol &&s) -> Expression {
+            auto it = tableRegistry.find(s);
+            if (it == tableRegistry.end() || !it->second.lazy)
+              return Expression(std::move(s));
+
+            auto const &entry = it->second;
+
+            boss::ExpressionArguments colArgs;
+            for (auto const &col : entry.columns)
+              colArgs.emplace_back(col);
+
+            boss::ExpressionArguments gatherArgs;
+            gatherArgs.emplace_back(entry.url);
+            gatherArgs.emplace_back(entry.loaderPath);
+            gatherArgs.emplace_back(ComplexExpression("Table"_, {}, {}, {}));
+            gatherArgs.emplace_back(ComplexExpression("List"_, {}, std::move(colArgs), {}));
+
+            return Expression(ComplexExpression("Gather"_, {}, std::move(gatherArgs), {}));
           },
           [](auto &&other) -> Expression { return Expression(std::move(other)); }),
       std::move(e));
