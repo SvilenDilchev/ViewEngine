@@ -23,7 +23,6 @@
 using boss::ComplexExpression;
 using boss::Expression;
 using boss::Symbol;
-using boss::utilities::operator""_;
 
 enum class CacheEntryType {
   Borrowed, // Cached value moved out of view registry and moved back in at pipeline end
@@ -78,6 +77,8 @@ inline CacheRegistry defaultCacheRegistry;
 // Parses a WithCaches expression, populates registry with Borrowed
 // and Pending entries, and returns the actual query (last arg).
 inline Expression unpackWithCaches(Expression &&expr, CacheRegistry &registry) {
+  using boss::utilities::operator""_;
+
   auto [head, statics, dynamics, spans] = std::move(std::get<ComplexExpression>(expr)).decompose();
 
   auto const numArgs = dynamics.size();
@@ -104,6 +105,8 @@ inline Expression unpackWithCaches(Expression &&expr, CacheRegistry &registry) {
 }
 
 inline Expression repackWithCaches(CacheRegistry &&registry, Expression &&finalExpr) {
+  using boss::utilities::operator""_;
+
   boss::ExpressionArguments args;
   args.reserve(registry.size() + 1);
 
