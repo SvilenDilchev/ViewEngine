@@ -114,9 +114,7 @@ static void expandSignature(Signature &sig, std::unordered_map<boss::Symbol, Sig
   while (it != sig.viewPredicates.end()) {
     const auto &viewName = it->first;
     auto regIt = viewRegistry.find(viewName);
-    if (regIt == viewRegistry.end())
-      throw std::runtime_error("View in signature not found in registry: " + viewName.getName());
-    if (regIt->second.cached.has_value() || seen.count(viewName)) {
+    if (regIt == viewRegistry.end() || regIt->second.cached.has_value() || seen.count(viewName)) {
       ++it;
       continue;
     }
