@@ -637,6 +637,8 @@
 
 (test-group "Symbol substitution"
 
+  (ve-eval (ClearViews))
+
   (test "Lazy table symbol rewrites to Gather"
         '(Gather "/data/sub_lazy.tbl" "/lib/loader.so" (Table) (List sub_col_a sub_col_b))
         (begin
