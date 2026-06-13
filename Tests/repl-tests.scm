@@ -688,3 +688,42 @@
           (ve-eval (RegisterTable sub_cleared "/data/sub_cleared.tbl" "/lib/loader.so" #t sub_cleared_col))
           (ve-eval (ClearTables))
           (ve-eval sub_cleared))))
+
+(test-group "Column pruning"
+
+  (ve-eval (ClearViews))
+  (ve-eval (ClearTables))
+
+  (test "Filter without Project gathers all columns"
+      '(Filter (Gather "/data/cp.tbl" "/lib/loader.so" (Table) (List cp_a cp_b cp_c)) (Greater cp_a 1))
+      (begin
+        (ve-eval (RegisterTable cp_tbl "/data/cp.tbl" "/lib/loader.so" #t cp_a cp_b cp_c))
+        (ve-eval (Filter cp_tbl (Greater cp_a 1)))))
+
+  (test "Project referencing subset of columns only gathers those columns"
+        '(Project (Gather "/data/cp2.tbl" "/lib/loader.so" (Table) (List cp2_a cp2_b)) cp2_a cp2_b)
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable cp2_tbl "/data/cp2.tbl" "/lib/loader.so" #t cp2_a cp2_b cp2_c cp2_d))
+          (ve-eval (Project cp2_tbl cp2_a cp2_b))))
+
+  (test "Filter and Project combined only gathers referenced columns"
+        '(Project (Filter (Gather "/data/cp3.tbl" "/lib/loader.so" (Table) (List cp3_a cp3_b)) (Greater cp3_b 5)) cp3_a)
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable cp3_tbl "/data/cp3.tbl" "/lib/loader.so" #t cp3_a cp3_b cp3_c))
+          (ve-eval (Project (Filter cp3_tbl (Greater cp3_b 5)) cp3_a))))
+
+  (test "No projections falls back to all columns"
+        '(Gather "/data/cp4.tbl" "/lib/loader.so" (Table) (List cp4_a cp4_b cp4_c))
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable cp4_tbl "/data/cp4.tbl" "/lib/loader.so" #t cp4_a cp4_b cp4_c))
+          (ve-eval cp4_tbl)))
+
+  (test "Eager table is not affected by column pruning"
+        '(Project cp5_tbl cp5_a)
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable cp5_tbl "/data/cp5.tbl" "/lib/loader.so" #f cp5_a cp5_b cp5_c))
+          (ve-eval (Project cp5_tbl cp5_a)))))

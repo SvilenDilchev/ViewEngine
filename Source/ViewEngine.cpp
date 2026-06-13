@@ -399,19 +399,15 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
             auto const &entry = it->second;
 
             boss::ExpressionArguments colArgs;
-            if (queryMetadata && !queryMetadata->signature.projectedColumns.empty()) {
-              if (auto colIt = queryMetadata->referencedTableColumns.find(s);
-                  colIt != queryMetadata->referencedTableColumns.end()) {
-                for (auto const &col : colIt->second)
-                  colArgs.emplace_back(col);
-              }
-            }
+            const std::unordered_set<Symbol> *referencedColumns = nullptr;
+            if (queryMetadata && !queryMetadata->signature.projectedColumns.empty())
+              if (auto it = queryMetadata->referencedTableColumns.find(s);
+                  it != queryMetadata->referencedTableColumns.end())
+                referencedColumns = &it->second;
 
-            // Fallback if no referenced columns or all are projected
-            if (colArgs.empty()) {
-              for (auto const &col : entry.columns)
-                colArgs.emplace_back(col);
-            }
+            for (auto const &col : entry.columns)
+              if (!referencedColumns || referencedColumns->count(col))
+                colArgs.emplace_back(col); // Follow schema ordering for columns in the Gather args
 
             boss::ExpressionArguments gatherArgs;
             gatherArgs.emplace_back(entry.url);
