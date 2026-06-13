@@ -1,4 +1,5 @@
 #include "QueryRewriter.hpp"
+#include "MetadataRegistry.hpp"
 #include "ViewRegistry.hpp"
 #include <unordered_set>
 
@@ -61,6 +62,7 @@ static void assignPredicateToSources(Expression &&pred, ViewMetadata &metadata,
   std::vector<Expression> leaves;
   flattenPredicates(std::move(pred), leaves, metadata.sideEffect);
   for (auto &leaf : leaves) {
+    walkView(leaf, metadata, sources); // Walk the leaf to find any referenced tables/views
     auto key = serializeExpr(leaf);
     auto shared = std::make_shared<Expression>(std::move(leaf));
     for (const auto &src : sources.first)
@@ -176,6 +178,8 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
 
               walkView(dynamics[0], metadata, sources);
               for (size_t i = 1; i < dynamics.size(); ++i) {
+                walkView(dynamics[i], metadata,
+                         sources); // Walk projected expressions to find any referenced tables/views
                 auto key = serializeExpr(dynamics[i]);
                 auto shared = std::make_shared<Expression>(
                     dynamics[i].clone(CloneReason::EXPRESSION_WRAPPING));
@@ -242,13 +246,26 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
                 // Treat malformed passthrough operators as side effect
                 metadata.sideEffect = true;
               }
-              walkView(dynamics[0], metadata, sources);
+              for (size_t i = 0; i < dynamics.size(); ++i) {
+                walkView(dynamics[i], metadata, sources);
+              }
               return;
             }
 
             for (const auto &arg : dynamics) {
               walkView(arg, metadata, sources);
             }
+          },
+          [&](const Symbol &s) {
+            if (tableRegistry.count(s))
+              sources.first.insert(s);
+
+            auto it = columnRegistry.find(s);
+            if (it == columnRegistry.end())
+              return;
+            for (const auto &table : it->second)
+              if (sources.first.count(table))
+                metadata.referencedTableColumns[table].insert(s);
           },
           [](const auto &) {}),
       expr);
@@ -362,28 +379,24 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
          W_PROJ * projectionCoverage;
 }
 
-std::optional<boss::Symbol> findRewriting(const Expression &query) {
+std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata &queryMetadata,
+                                          SourceSets &querySources) {
   // Only attempt rewriting if the top-level operator is one we support rewriting for
   auto *ce = std::get_if<ComplexExpression>(&query);
   if (!ce || !rewritableOperators.count(ce->getHead()))
     return std::nullopt;
 
-  // Step 1: extract query signature
-  ViewMetadata queryMetadata;
-  SourceSets querySources;
-  walkView(query, queryMetadata, querySources);
-
   if (queryMetadata.sideEffect)
     return std::nullopt;
 
-  // Step 2: find candidate views
+  // Step 1: find candidate views
   std::unordered_set<boss::Symbol> candidates;
   findCandidateViews(querySources.first, candidates);
 
   if (candidates.empty())
     return std::nullopt;
 
-  // Step 3: score each candidate and return if perfect match found
+  // Step 2: score each candidate and return if perfect match found
   // TODO: consider non-perfect matches and extract remainder to apply on top of the view
   for (const auto &viewName : candidates) {
     auto it = viewRegistry.find(viewName);

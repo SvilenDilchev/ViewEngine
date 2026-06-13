@@ -57,10 +57,13 @@ using SourceSets = std::pair<std::unordered_set<boss::Symbol>, std::unordered_se
 // - dependencies: view names referenced via QueryView
 // - sideEffect: true if the definition contains prohibited operations
 // - signature: tables, predicates, projections, and joins found in the expression
+// - referencedTableColums: a map of table names to the set of column names referenced in the
+// expression
 struct ViewMetadata {
   std::unordered_set<boss::Symbol> dependencies;
   bool sideEffect = false;
   Signature signature;
+  std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> referencedTableColumns;
 };
 
 // Recursively walks a view definition expression, populating ViewMetadata;
@@ -75,4 +78,5 @@ double scoreView(const Signature &viewParts, const Signature &queryParts);
 
 // Return the best scoring view for the given query, or nullopt if no rewriting is possible
 // Currently only returns a perfect match (score of 1.0)
-std::optional<boss::Symbol> findRewriting(const Expression &query);
+std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata &queryMetadata,
+                                          SourceSets &querySources);

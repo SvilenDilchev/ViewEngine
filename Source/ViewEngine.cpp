@@ -4,21 +4,31 @@
 
 using boss::expressions::CloneReason;
 
-static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLevel = false) {
+static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr,
+                           bool skipRewrite = false, bool topLevel = false) {
   // Attempt to rewrite incoming query using view definitions top-down
   // Skip rewrite if incoming expression was generated from a evaluation of a QueryView
+  ViewMetadata metadata;
   if (!skipRewrite) {
-    if (auto match = findRewriting(e)) {
+    // Extract expression metadata always
+    SourceSets sources;
+    walkView(e, metadata, sources);
+
+    if (topLevel) {
+      queryMetadata = &metadata;
+    }
+
+    if (auto match = findRewriting(e, metadata, sources)) {
       boss::ExpressionArguments args;
       args.emplace_back(Symbol(*match));
       return evaluate(Expression(ComplexExpression("QueryView"_, {}, std::move(args), {})),
-                      skipRewrite, topLevel);
+                      queryMetadata, skipRewrite, topLevel);
     }
   }
 
   return std::visit(
       boss::utilities::overload(
-          [skipRewrite, topLevel](ComplexExpression &&ce) -> Expression {
+          [queryMetadata, skipRewrite, topLevel](ComplexExpression &&ce) -> Expression {
             auto [head, statics, dynamics, spans] = std::move(ce).decompose();
 
             if (head == "DefineView"_) {
@@ -141,8 +151,8 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
               } guard{viewName};
 
               // Cache miss
-              auto result =
-                  evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION), true);
+              auto result = evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
+                                     queryMetadata, true);
 
               if (!shouldCache)
                 return std::move(result); // Return without caching
@@ -180,13 +190,13 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
                                            name.getName());
 
                 if (!it->second.cached)
-                  it->second.cached = evaluate(std::move(entry.value), true);
+                  it->second.cached = evaluate(std::move(entry.value), queryMetadata, true);
               }
               defaultCacheRegistry.clear();
 
               // Evaluate with the final expression as a top-level expression, so that a CacheRef
               // operator will be correctly handled and cached
-              return evaluate(std::move(finalExpr), true);
+              return evaluate(std::move(finalExpr), queryMetadata, true);
             }
 
             // Handle leftover CacheRef operators in the pipeline on second pass
@@ -213,7 +223,7 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
                   throw std::runtime_error(
                       "CacheRef could not be resolved, entry not found in cache registry: " +
                       viewName.getName());
-                it->second.cached = evaluate(std::move(regIt->second.value), true);
+                it->second.cached = evaluate(std::move(regIt->second.value), queryMetadata, true);
               }
 
               // Return cached value for final result
@@ -331,7 +341,8 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
                 columns.push_back(std::move(*col));
               }
 
-              return Expression(registerTable(std::move(*name), std::move(*url), std::move(*loaderPath), *lazy, std::move(columns)));
+              return Expression(registerTable(std::move(*name), std::move(*url),
+                                              std::move(*loaderPath), *lazy, std::move(columns)));
             }
 
             if (head == "DropTable"_) {
@@ -371,14 +382,14 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
             // Check is here to block eval on second pass through ViewEngine in pipeline
             if (head != "ViewList"_ && head != "TableList"_) {
               for (auto &arg : dynamics) {
-                arg = evaluate(std::move(arg), skipRewrite);
+                arg = evaluate(std::move(arg), queryMetadata, skipRewrite);
               }
             }
 
             return Expression(ComplexExpression(std::move(head), std::move(statics),
                                                 std::move(dynamics), std::move(spans)));
           },
-          [](Symbol &&s) -> Expression {
+          [queryMetadata](Symbol &&s) -> Expression {
             auto it = tableRegistry.find(s);
             if (it == tableRegistry.end() || !it->second.lazy)
               return Expression(std::move(s));
@@ -386,8 +397,19 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
             auto const &entry = it->second;
 
             boss::ExpressionArguments colArgs;
-            for (auto const &col : entry.columns)
-              colArgs.emplace_back(col);
+            if (queryMetadata && !queryMetadata->signature.projectedColumns.empty()) {
+              if (auto colIt = queryMetadata->referencedTableColumns.find(s);
+                  colIt != queryMetadata->referencedTableColumns.end()) {
+                for (auto const &col : colIt->second)
+                  colArgs.emplace_back(col);
+              }
+            }
+
+            // Fallback if no referenced columns or all are projected
+            if (colArgs.empty()) {
+              for (auto const &col : entry.columns)
+                colArgs.emplace_back(col);
+            }
 
             boss::ExpressionArguments gatherArgs;
             gatherArgs.emplace_back(entry.url);
@@ -403,7 +425,7 @@ static Expression evaluate(Expression &&e, bool skipRewrite = false, bool topLev
 
 extern "C" BOSSExpression *evaluate(BOSSExpression *e) {
   defaultCacheRegistry.clear();
-  auto result = evaluate(std::move(e->delegate), false, true);
+  auto result = evaluate(std::move(e->delegate), nullptr, false, true);
 
   if (defaultCacheRegistry.empty())
     return new BOSSExpression{.delegate = std::move(result)};
