@@ -27,18 +27,20 @@ bool hasCycle(const boss::Symbol &newView, const boss::Symbol &current,
   return false;
 }
 
-// TODO: use the viewToViews reverse dependency index to optimize this instead of brute force
-// scanning all views
 void invalidateDependentCaches(const boss::Symbol &invalidatedView,
                                std::unordered_set<boss::Symbol> &seen) {
-  for (auto &[name, entry] : viewRegistry) {
-    if (seen.count(name))
+  auto it = viewToViews.find(invalidatedView);
+  if (it == viewToViews.end())
+    return;
+
+  for (const auto &dependent : it->second) {
+    if (seen.count(dependent))
       continue;
-    if (entry.dependencies.count(invalidatedView)) {
-      entry.cached = std::nullopt;
-      seen.insert(name);
-      invalidateDependentCaches(name, seen);
-    }
+    seen.insert(dependent);
+    auto vit = viewRegistry.find(dependent);
+    if (vit != viewRegistry.end())
+      vit->second.cached = std::nullopt;
+    invalidateDependentCaches(dependent, seen);
   }
 }
 
