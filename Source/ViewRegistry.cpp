@@ -1,7 +1,5 @@
 #include "ViewRegistry.hpp"
 
-#include <stack>
-
 std::unordered_map<boss::Symbol, ViewEntry> viewRegistry;
 std::unordered_set<boss::Symbol> evaluationStack;
 std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> tableToViews;
@@ -41,31 +39,5 @@ void invalidateDependentCaches(const boss::Symbol &invalidatedView,
     if (vit != viewRegistry.end())
       vit->second.cached = std::nullopt;
     invalidateDependentCaches(dependent, seen);
-  }
-}
-
-void findCandidateViews(const std::unordered_set<boss::Symbol> &tables,
-                        std::unordered_set<boss::Symbol> &candidates) {
-
-  std::stack<boss::Symbol> toVisit;
-  std::unordered_set<boss::Symbol> expanded;
-
-  // Add direct candidates based on table index
-  for (const auto &table : tables)
-    if (auto it = tableToViews.find(table); it != tableToViews.end())
-      for (const auto &viewName : it->second)
-        if (candidates.insert(viewName).second)
-          toVisit.push(viewName);
-
-  // DFS to find indirect candidates via view dependencies
-  while (!toVisit.empty()) {
-    auto current = toVisit.top();
-    toVisit.pop();
-    if (!expanded.insert(current).second)
-      continue; // already expanded this view, skip
-    if (auto it = viewToViews.find(current); it != viewToViews.end())
-      for (const auto &dependent : it->second)
-        if (candidates.insert(dependent).second)
-          toVisit.push(dependent);
   }
 }

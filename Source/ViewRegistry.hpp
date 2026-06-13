@@ -17,6 +17,8 @@ extern std::unordered_set<boss::Symbol> evaluationStack;         // Guard agains
 
 // Indexes for efficient candidate view lookup during rewriting
 // Table name -> set of view names that directly touch that table
+// Currently not used in query rewriter, but not completely deprecated as a start for future
+// optimisations based on minicon or GQR
 extern std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> tableToViews;
 // View name -> set of view names that directly depend on it (reverse dependency map)
 extern std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> viewToViews;
@@ -27,6 +29,3 @@ bool hasCycle(const boss::Symbol &newView, const boss::Symbol &current,
 // Invalidate caches of all views that directly or indirectly depend on the given view
 void invalidateDependentCaches(const boss::Symbol &invalidatedView,
                                std::unordered_set<boss::Symbol> &seen);
-// DFS walk on indexes to find all views that use the same tables as the incoming query
-void findCandidateViews(const std::unordered_set<boss::Symbol> &tables,
-                        std::unordered_set<boss::Symbol> &candidates);

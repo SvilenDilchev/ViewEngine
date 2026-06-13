@@ -6,14 +6,14 @@
 using boss::expressions::CloneReason;
 using boss::utilities::operator""_;
 
-static std::unordered_set<boss::Symbol> sideEffectOperators = {"DefineView"_, "DropView"_,
-                                                               "ClearViews"_};
+static const std::unordered_set<boss::Symbol> sideEffectOperators = {"DefineView"_, "DropView"_,
+                                                                     "ClearViews"_};
 
 static const std::unordered_set<boss::Symbol> rewritableOperators = {
     "Filter"_, "Join"_, "LeftJoin"_, "AntiJoin"_, "Project"_};
 
 // Map for parsing BOSS symbols into JoinType enum values
-static std::unordered_map<boss::Symbol, JoinType> joinTypeMap = {
+static const std::unordered_map<boss::Symbol, JoinType> joinTypeMap = {
     {"Join"_, JoinType::INNER}, {"LeftJoin"_, JoinType::LEFT}, {"AntiJoin"_, JoinType::ANTI}};
 
 // TODO: canonicalise serialised predicates (e.g., Equal(a, b) vs Equal(b, a))
@@ -57,18 +57,17 @@ static void flattenPredicates(Expression &&pred, std::vector<Expression> &out, b
              std::move(pred));
 }
 
-static void assignPredicateToSources(Expression &&pred, ViewMetadata &metadata,
-                                     SourceSets &sources) {
+static void assignPredicateToSources(Expression &&pred, ViewMetadata &metadata) {
   std::vector<Expression> leaves;
   flattenPredicates(std::move(pred), leaves, metadata.sideEffect);
   for (auto &leaf : leaves) {
-    walkView(leaf, metadata, sources); // Walk the leaf to find any referenced tables/views
+    walkView(leaf, metadata); // Walk the leaf to find any referenced tables/views
     auto key = serializeExpr(leaf);
     auto shared = std::make_shared<Expression>(std::move(leaf));
-    for (const auto &src : sources.first)
+    for (const auto &[src, _] : metadata.signature.tablePredicates)
       metadata.signature.tablePredicates[src].emplace(
           key, shared); // Can't move because we need them for every source in the loop
-    for (const auto &src : sources.second)
+    for (const auto &[src, _] : metadata.signature.viewPredicates)
       metadata.signature.viewPredicates[src].emplace(key, shared);
   }
 }
@@ -90,7 +89,84 @@ static bool isSafeUnmatchedJoin(const JoinEdge &viewEdge, const Signature &query
   return true;
 }
 
-void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &sources) {
+// Returns a set of keys of a given map, used for snapshotting sources before walking into a subtree
+static std::unordered_set<const boss::Symbol *> snapshotKeys(const auto &map) {
+  std::unordered_set<const boss::Symbol *> snap;
+  snap.reserve(map.size());
+  for (auto &[k, _] : map)
+    snap.insert(&k);
+  return snap;
+}
+
+// Used to collect new sources added to the metadata signature after walking into a subtree, for
+// join edge construction
+static void collectNewKeys(const auto &map, const std::unordered_set<const boss::Symbol *> &before,
+                           std::unordered_set<boss::Symbol> &out) {
+  for (auto &[k, _] : map)
+    if (!before.count(&k))
+      out.insert(k);
+}
+
+// Expands uncached view sources down to their base tables for accurate comparisons
+static void expandSignature(Signature &sig, std::unordered_map<boss::Symbol, Signature> &cache,
+                            std::unordered_set<boss::Symbol> &seen) {
+  auto it = sig.viewPredicates.begin();
+  while (it != sig.viewPredicates.end()) {
+    const auto &viewName = it->first;
+    auto regIt = viewRegistry.find(viewName);
+    if (regIt == viewRegistry.end())
+      throw std::runtime_error("View in signature not found in registry: " + viewName.getName());
+    if (regIt->second.cached.has_value() || seen.count(viewName)) {
+      ++it;
+      continue;
+    }
+    seen.insert(viewName);
+    if (!cache.count(viewName)) {
+      cache[viewName] = regIt->second.signature; // Cache signatures of views we've expanded to
+                                                 // avoid redundant work and infinite recursion on
+                                                 // cycles  expandSignature(cache[viewName], cache);
+      expandSignature(cache[viewName], cache, seen);
+    }
+    auto &viewSig = cache[viewName];
+
+    // merge tablePredicates
+    for (auto &[table, preds] : viewSig.tablePredicates)
+      for (auto &[key, expr] : preds)
+        sig.tablePredicates[table].emplace(key, expr);
+
+    // merge remaining viewPredicates (cached views referenced inside the expanded view)
+    for (auto &[view, preds] : viewSig.viewPredicates)
+      for (auto &[key, expr] : preds)
+        sig.viewPredicates[view].emplace(key, expr);
+
+    // expand view name in join edges
+    for (auto &edge : sig.joinEdges) {
+      bool wasLeft = edge.leftSources.erase(viewName);
+      bool wasRight = edge.rightSources.erase(viewName);
+      if (!wasLeft && !wasRight)
+        continue;
+      for (const auto &[table, _] : viewSig.tablePredicates) {
+        if (wasLeft)
+          edge.leftSources.insert(table);
+        if (wasRight)
+          edge.rightSources.insert(table);
+      }
+      for (const auto &[view, _] : viewSig.viewPredicates) {
+        if (wasLeft)
+          edge.leftSources.insert(view);
+        if (wasRight)
+          edge.rightSources.insert(view);
+      }
+    }
+
+    for (auto &edge : viewSig.joinEdges)
+      sig.joinEdges.push_back(edge);
+
+    it = sig.viewPredicates.erase(it);
+  }
+}
+
+void walkView(const Expression &expr, ViewMetadata &metadata) {
   std::visit(
       boss::utilities::overload(
           [&](const ComplexExpression &ce) {
@@ -124,7 +200,6 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
 
               metadata.dependencies.insert(*viewName);
               metadata.signature.viewPredicates.try_emplace(*viewName);
-              sources.second.insert(*viewName);
               return;
             }
 
@@ -147,7 +222,6 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
               }
 
               metadata.signature.tablePredicates.try_emplace(*tableName);
-              sources.first.insert(*tableName);
               return;
             }
 
@@ -157,7 +231,7 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
                 return;
               }
 
-              walkView(dynamics[0], metadata, sources);
+              walkView(dynamics[0], metadata);
 
               // TODO: predicates are assigned to all sources in the subtree because we
               // lack schema information to determine which table owns which column. This
@@ -166,7 +240,7 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
               // has l_price on orders after the join. Fix: load table schemas and resolve
               // column-to-table ownership before assignment.
               assignPredicateToSources(dynamics[1].clone(CloneReason::EXPRESSION_WRAPPING),
-                                       metadata, sources);
+                                       metadata);
               return;
             }
 
@@ -176,10 +250,9 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
                 return;
               }
 
-              walkView(dynamics[0], metadata, sources);
+              walkView(dynamics[0], metadata);
               for (size_t i = 1; i < dynamics.size(); ++i) {
-                walkView(dynamics[i], metadata,
-                         sources); // Walk projected expressions to find any referenced tables/views
+                walkView(dynamics[i], metadata);
                 auto key = serializeExpr(dynamics[i]);
                 auto shared = std::make_shared<Expression>(
                     dynamics[i].clone(CloneReason::EXPRESSION_WRAPPING));
@@ -195,19 +268,19 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
               }
 
               JoinType parsedJoinType = it->second;
-              SourceSets leftSources, rightSources;
-              walkView(dynamics[0], metadata, leftSources);
-              walkView(dynamics[1], metadata, rightSources);
+              std::unordered_set<boss::Symbol> allLefts, allRights;
 
-              std::unordered_set<boss::Symbol> allLefts = leftSources.first;
-              allLefts.insert(leftSources.second.begin(), leftSources.second.end());
-              std::unordered_set<boss::Symbol> allRights = rightSources.first;
-              allRights.insert(rightSources.second.begin(), rightSources.second.end());
+              auto tablePointersBefore = snapshotKeys(metadata.signature.tablePredicates);
+              auto viewPointersBefore = snapshotKeys(metadata.signature.viewPredicates);
+              walkView(dynamics[0], metadata);
+              collectNewKeys(metadata.signature.tablePredicates, tablePointersBefore, allLefts);
+              collectNewKeys(metadata.signature.viewPredicates, viewPointersBefore, allLefts);
 
-              sources.first.merge(leftSources.first);
-              sources.first.merge(rightSources.first);
-              sources.second.merge(leftSources.second);
-              sources.second.merge(rightSources.second);
+              auto tablePointersMid = snapshotKeys(metadata.signature.tablePredicates);
+              auto viewPointersMid = snapshotKeys(metadata.signature.viewPredicates);
+              walkView(dynamics[1], metadata);
+              collectNewKeys(metadata.signature.tablePredicates, tablePointersMid, allRights);
+              collectNewKeys(metadata.signature.viewPredicates, viewPointersMid, allRights);
 
               boss::ExpressionArguments leftKeysArgs, rightKeysArgs;
               for (size_t i = 2; i < dynamics.size(); ++i) {
@@ -223,7 +296,7 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
                 } else {
                   // It is a residual filter (or a boolean literal, etc.): assign to tables
                   assignPredicateToSources(dynamics[i].clone(CloneReason::EXPRESSION_WRAPPING),
-                                           metadata, sources);
+                                           metadata);
                 }
               }
 
@@ -233,9 +306,10 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
               Expression leftKeys = ComplexExpression("Keys"_, {}, std::move(leftKeysArgs));
               Expression rightKeys = ComplexExpression("Keys"_, {}, std::move(rightKeysArgs));
 
-              metadata.signature.joinEdges.push_back({std::move(allLefts), std::move(allRights),
-                                                      std::move(leftKeys), std::move(rightKeys),
-                                                      parsedJoinType});
+              metadata.signature.joinEdges.push_back(
+                  {std::move(allLefts), std::move(allRights),
+                   std::make_shared<Expression>(std::move(leftKeys)),
+                   std::make_shared<Expression>(std::move(rightKeys)), parsedJoinType});
               return;
             }
 
@@ -247,24 +321,24 @@ void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &source
                 metadata.sideEffect = true;
               }
               for (size_t i = 0; i < dynamics.size(); ++i) {
-                walkView(dynamics[i], metadata, sources);
+                walkView(dynamics[i], metadata);
               }
               return;
             }
 
             for (const auto &arg : dynamics) {
-              walkView(arg, metadata, sources);
+              walkView(arg, metadata);
             }
           },
           [&](const Symbol &s) {
             if (tableRegistry.count(s))
-              sources.first.insert(s);
+              metadata.signature.tablePredicates.try_emplace(s);
 
             auto it = columnRegistry.find(s);
             if (it == columnRegistry.end())
               return;
             for (const auto &table : it->second)
-              if (sources.first.count(table))
+              if (metadata.signature.tablePredicates.count(table))
                 metadata.referencedTableColumns[table].insert(s);
           },
           [](const auto &) {}),
@@ -325,8 +399,8 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
   // predicates
   std::unordered_set<size_t> matchedQueryJoinIndices;
   for (const auto &viewEdge : viewParts.joinEdges) {
-    auto viewLeftKey = serializeExpr(viewEdge.leftKeys);
-    auto viewRightKey = serializeExpr(viewEdge.rightKeys);
+    auto viewLeftKey = serializeExpr(*viewEdge.leftKeys);
+    auto viewRightKey = serializeExpr(*viewEdge.rightKeys);
     bool matched = false;
     for (size_t i = 0; i < queryParts.joinEdges.size(); ++i) {
       const auto &queryEdge = queryParts.joinEdges[i];
@@ -336,8 +410,8 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
       if (viewEdge.joinType == queryEdge.joinType &&
           viewEdge.leftSources == queryEdge.leftSources &&
           viewEdge.rightSources == queryEdge.rightSources &&
-          viewLeftKey == serializeExpr(queryEdge.leftKeys) &&
-          viewRightKey == serializeExpr(queryEdge.rightKeys)) {
+          viewLeftKey == serializeExpr(*queryEdge.leftKeys) &&
+          viewRightKey == serializeExpr(*queryEdge.rightKeys)) {
         matchedQueryJoinIndices.insert(i);
         matched = true;
         break;
@@ -379,8 +453,7 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
          W_PROJ * projectionCoverage;
 }
 
-std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata &queryMetadata,
-                                          SourceSets &querySources) {
+std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata &queryMetadata) {
   // Only attempt rewriting if the top-level operator is one we support rewriting for
   auto *ce = std::get_if<ComplexExpression>(&query);
   if (!ce || !rewritableOperators.count(ce->getHead()))
@@ -389,24 +462,25 @@ std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata 
   if (queryMetadata.sideEffect)
     return std::nullopt;
 
-  // Step 1: find candidate views
-  std::unordered_set<boss::Symbol> candidates;
-  findCandidateViews(querySources.first, candidates);
+  // TODO: explore having a cross-query cache (goes together with the tableToViews TODO)
+  // Cache for expanded view signatures
+  std::unordered_map<boss::Symbol, Signature> cache;
+  // Track seen views to avoid merging the same view signature multiple times
+  std::unordered_set<boss::Symbol> seen;
+  // Expand query signature in place - resolves uncached view references to their base tables
+  expandSignature(queryMetadata.signature, cache, seen);
 
-  if (candidates.empty())
-    return std::nullopt;
+  // TODO: look into building a complete reverse index of base table -> top level views that
+  // reference it at define time to nuke the search space instead of scanning all views
+  for (const auto &[name, entry] : viewRegistry) {
+    Signature viewSig = entry.signature;
+    seen.clear();
+    expandSignature(viewSig, cache, seen);
 
-  // Step 2: score each candidate and return if perfect match found
-  // TODO: consider non-perfect matches and extract remainder to apply on top of the view
-  for (const auto &viewName : candidates) {
-    auto it = viewRegistry.find(viewName);
-    if (it == viewRegistry.end())
-      continue;
-
-    double score = scoreView(it->second.signature, queryMetadata.signature);
-
+    double score = scoreView(viewSig, queryMetadata.signature);
+    // TODO: consider non-perfect matches and extract remainder to apply on top of the view
     if (score >= 1.0)
-      return viewName;
+      return name;
   }
   return std::nullopt;
 }

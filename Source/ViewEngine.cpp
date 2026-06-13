@@ -11,18 +11,17 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
   ViewMetadata metadata;
   if (!skipRewrite) {
     // Extract expression metadata always
-    SourceSets sources;
-    walkView(e, metadata, sources);
+    walkView(e, metadata);
 
     if (topLevel) {
       queryMetadata = &metadata;
     }
 
-    if (auto match = findRewriting(e, metadata, sources)) {
+    if (auto match = findRewriting(e, metadata)) {
       boss::ExpressionArguments args;
       args.emplace_back(Symbol(*match));
-      return evaluate(Expression(ComplexExpression("QueryView"_, {}, std::move(args), {})),
-                      queryMetadata, skipRewrite, topLevel);
+      auto rewritten = Expression(ComplexExpression("QueryView"_, {}, std::move(args), {}));
+      return evaluate(std::move(rewritten), queryMetadata, skipRewrite, topLevel);
     }
   }
 
@@ -46,10 +45,8 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               auto viewName = std::move(*name);
 
               ViewMetadata metadata;
-              SourceSets sources;
-              walkView(dynamics[1], metadata,
-                       sources); // Walk the view expression to collect data for
-                                 // dependency graph construction and validation
+              walkView(dynamics[1], metadata); // Walk the view expression to collect data for
+                                               // dependency graph construction and validation
 
               if (metadata.sideEffect)
                 // Block if definition has side effects such as defining or dropping views
@@ -73,6 +70,11 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               }
 
               // Add new index entries
+              // TODO: expand signature at define time and populate tableToViews with full
+              // transitive base table set — would allow findRewriting to use tableToViews for
+              // efficient candidate lookup instead of scanning the full registry. Same DFS pass
+              // could replace hasCycle traversal above, doing cycle detection and index building in
+              // one walk.
               for (const auto &[tableName, _] : metadata.signature.tablePredicates)
                 tableToViews[tableName].insert(viewName);
               for (const auto &dep : metadata.dependencies)

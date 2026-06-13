@@ -28,8 +28,8 @@ enum class JoinType { INNER, LEFT, ANTI };
 struct JoinEdge {
   std::unordered_set<boss::Symbol> leftSources;
   std::unordered_set<boss::Symbol> rightSources;
-  Expression leftKeys;
-  Expression rightKeys;
+  std::shared_ptr<Expression> leftKeys;
+  std::shared_ptr<Expression> rightKeys;
   JoinType joinType; // "Join", "LeftJoin", "AntiJoin"
 };
 
@@ -49,10 +49,6 @@ struct Signature {
   std::vector<JoinEdge> joinEdges;
 };
 
-// Query sources tracked during walking bottom down for predicate assignments
-// Sources are <tables names and view names>
-using SourceSets = std::pair<std::unordered_set<boss::Symbol>, std::unordered_set<boss::Symbol>>;
-
 // Metadata collected during expression tree walking
 // - dependencies: view names referenced via QueryView
 // - sideEffect: true if the definition contains prohibited operations
@@ -70,7 +66,7 @@ struct ViewMetadata {
 // Sources (tables and views) found in the current subtree are accumulated into
 // the provided SourceSets, allowing callers to track which sources belong to
 // which side of a join.
-void walkView(const Expression &expr, ViewMetadata &metadata, SourceSets &sources);
+void walkView(const Expression &expr, ViewMetadata &metadata);
 
 // Scores a view against a query based on how well the view's signature covers the query's
 // signature; Returns -1.0 if view is not usable, otherwise a score >= 0, <= 1.0
@@ -78,5 +74,4 @@ double scoreView(const Signature &viewParts, const Signature &queryParts);
 
 // Return the best scoring view for the given query, or nullopt if no rewriting is possible
 // Currently only returns a perfect match (score of 1.0)
-std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata &queryMetadata,
-                                          SourceSets &querySources);
+std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata &queryMetadata);
