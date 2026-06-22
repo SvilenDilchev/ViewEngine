@@ -34,39 +34,44 @@ struct JoinEdge {
 };
 
 struct Signature {
-  // Map of base table name to the predicates that apply to it,
+  // Set of base tables the expression references
+  std::unordered_set<boss::Symbol> baseTables;
+  // Map of column name to the predicates that apply to it,
   // which are stored as a serialised string key to the actual expression
   std::unordered_map<boss::Symbol, std::unordered_map<std::string, std::shared_ptr<Expression>>>
-      tablePredicates;
-  // Map of view names to the predicates that apply to them
-  // Views are kept opaque at walking stage and at comparison stage
-  // are either expanded or directly compared based on whether the view is materialised
-  std::unordered_map<boss::Symbol, std::unordered_map<std::string, std::shared_ptr<Expression>>>
-      viewPredicates;
-  // Map of projected column names across the entire query
-  std::unordered_map<std::string, std::shared_ptr<Expression>> projectedColumns;
+      columnPredicates;
+  // Map of projected column names to the expressions that define them across the entire query
+  std::unordered_map<boss::Symbol, std::shared_ptr<Expression>> projectedColumns;
   // Join relationships between sources in the query
   std::vector<JoinEdge> joinEdges;
+
+  // Goes through columnPredicates, projectedColumns, and joinEdges to extract the columns needed to
+  // evaluate the expression; used for column pruning for the Gather operator
+  void extractAllReferencedColumns(std::unordered_set<boss::Symbol> &out) const;
 };
 
 // Metadata collected during expression tree walking
 // - dependencies: view names referenced via QueryView
+// - referencedColumns: columns referenced in the expression, used for pruning Gather outputs,
+// populated with extractAllReferencedColumns instead of during the walk
 // - sideEffect: true if the definition contains prohibited operations
 // - signature: tables, predicates, projections, and joins found in the expression
-// - referencedTableColums: a map of table names to the set of column names referenced in the
-// expression
+// - merge: helper function to combine metadata from subtrees
 struct ViewMetadata {
   std::unordered_set<boss::Symbol> dependencies;
+  std::unordered_set<boss::Symbol> referencedColumns;
   bool sideEffect = false;
   Signature signature;
-  std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> referencedTableColumns;
+
+  void merge(ViewMetadata &&other);
 };
 
 // Recursively walks a view definition expression, populating ViewMetadata;
-// Sources (tables and views) found in the current subtree are accumulated into
-// the provided SourceSets, allowing callers to track which sources belong to
-// which side of a join.
 void walkView(const Expression &expr, ViewMetadata &metadata);
+
+// Recursively resolve view dependencies, expanding the signature of a view definition
+void expandSignature(ViewMetadata &metadata, std::unordered_map<boss::Symbol, ViewMetadata> &cache,
+                     std::unordered_set<boss::Symbol> &seen);
 
 // Scores a view against a query based on how well the view's signature covers the query's
 // signature; Returns -1.0 if view is not usable, otherwise a score >= 0, <= 1.0
@@ -74,4 +79,6 @@ double scoreView(const Signature &viewParts, const Signature &queryParts);
 
 // Return the best scoring view for the given query, or nullopt if no rewriting is possible
 // Currently only returns a perfect match (score of 1.0)
-std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata &queryMetadata);
+std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata &queryMetadata,
+                                          std::unordered_map<boss::Symbol, ViewMetadata> &cache,
+                                          std::unordered_set<boss::Symbol> &seen);

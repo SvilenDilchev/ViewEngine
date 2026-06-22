@@ -12,6 +12,16 @@ static const std::unordered_set<boss::Symbol> sideEffectOperators = {"DefineView
 static const std::unordered_set<boss::Symbol> rewritableOperators = {
     "Filter"_, "Join"_, "LeftJoin"_, "AntiJoin"_, "Project"_};
 
+// Used to canonicalise predicates for comparisons and scoring
+// Greater(a, 5) and Less(5, a) are equivalent
+static const std::unordered_set<boss::Symbol> strictComparisonOperators = {
+    "Between"_, "Like"_, "Match_Substring"_, "IsValid"_};
+
+static const std::unordered_map<boss::Symbol, boss::Symbol> flipComparisonOperators = {
+    {"Equal"_, "Equal"_},  {"NotEqual"_, "NotEqual"_},
+    {"Greater"_, "Less"_}, {"GreaterEqual"_, "LessEqual"_},
+    {"Less"_, "Greater"_}, {"LessEqual"_, "GreaterEqual"_}};
+
 // Map for parsing BOSS symbols into JoinType enum values
 static const std::unordered_map<boss::Symbol, JoinType> joinTypeMap = {
     {"Join"_, JoinType::INNER}, {"LeftJoin"_, JoinType::LEFT}, {"AntiJoin"_, JoinType::ANTI}};
@@ -36,40 +46,56 @@ static std::string serializeExpr(const Expression &expr) {
                     expr);
 }
 
-// Flattens nested And predicates into a single vector of leaf predicates
-static void flattenPredicates(Expression &&pred, std::vector<Expression> &out, bool &sideEffect) {
+// Helper function to extract column symbols
+// Used to walk As operator expressions saved in projectedColumns
+static void extractColumnsFromExpr(const Expression &expr, std::unordered_set<boss::Symbol> &out) {
   std::visit(boss::utilities::overload(
-                 [&](ComplexExpression &&ce) {
-                   auto [head, statics, dynamics, spans] = std::move(ce).decompose();
-                   if (head == "And"_) {
-                     for (auto &arg : dynamics)
-                       flattenPredicates(std::move(arg), out, sideEffect);
-                   } else {
-                     if (sideEffectOperators.count(head)) {
-                       sideEffect = true;
-                       return; // Block side effect operators in predicates
-                     }
-                     out.emplace_back(ComplexExpression(std::move(head), std::move(statics),
-                                                        std::move(dynamics), std::move(spans)));
-                   }
+                 [&](const Symbol &s) {
+                   if (columnRegistry.find(s) != columnRegistry.end())
+                     out.insert(s);
                  },
-                 [&](auto &&other) { out.emplace_back(std::move(other)); }),
-             std::move(pred));
+                 [&](const ComplexExpression &ce) {
+                   for (const auto &arg : ce.getDynamicArguments())
+                     extractColumnsFromExpr(arg, out);
+                 },
+                 [](const auto &) {}),
+             expr);
 }
 
-static void assignPredicateToSources(Expression &&pred, ViewMetadata &metadata) {
-  std::vector<Expression> leaves;
-  flattenPredicates(std::move(pred), leaves, metadata.sideEffect);
-  for (auto &leaf : leaves) {
-    walkView(leaf, metadata); // Walk the leaf to find any referenced tables/views
-    auto key = serializeExpr(leaf);
-    auto shared = std::make_shared<Expression>(std::move(leaf));
-    for (const auto &[src, _] : metadata.signature.tablePredicates)
-      metadata.signature.tablePredicates[src].emplace(
-          key, shared); // Can't move because we need them for every source in the loop
-    for (const auto &[src, _] : metadata.signature.viewPredicates)
-      metadata.signature.viewPredicates[src].emplace(key, shared);
+void Signature::extractAllReferencedColumns(std::unordered_set<boss::Symbol> &out) const {
+  // Column predicate keys are directly column symbols
+  for (const auto &[col, _] : columnPredicates)
+    out.insert(col);
+  for (const auto &[col, expr] : projectedColumns) {
+    if (expr)
+      extractColumnsFromExpr(*expr, out);
+    else
+      out.insert(col);
   }
+}
+
+void ViewMetadata::merge(ViewMetadata &&other) {
+  dependencies.merge(other.dependencies);
+  sideEffect = sideEffect || other.sideEffect;
+  signature.baseTables.merge(other.signature.baseTables);
+  for (auto &[col, preds] : other.signature.columnPredicates)
+    signature.columnPredicates[col].merge(preds);
+  for (auto &[col, expr] : other.signature.projectedColumns) {
+    auto it = signature.projectedColumns.find(col);
+    if (it != signature.projectedColumns.end()) {
+      if (serializeExpr(*it->second) != serializeExpr(*expr)) {
+        // Conflicting projections on the same column from different join branches
+        sideEffect = true;
+        return;
+      }
+    } else {
+      signature.projectedColumns.emplace(col, expr);
+    }
+  }
+  signature.projectedColumns.merge(other.signature.projectedColumns);
+  signature.joinEdges.insert(signature.joinEdges.end(),
+                             std::make_move_iterator(other.signature.joinEdges.begin()),
+                             std::make_move_iterator(other.signature.joinEdges.end()));
 }
 
 // Checks if a view join predicate is non-destructive with respect to
@@ -79,7 +105,7 @@ static bool isSafeUnmatchedJoin(const JoinEdge &viewEdge, const Signature &query
     return false; // If join is destructive on both sides (e.g., Inner Join)
 
   for (const auto &src : viewEdge.rightSources) {
-    if (queryParts.tablePredicates.count(src) || queryParts.viewPredicates.count(src))
+    if (queryParts.baseTables.count(src))
       return false; // If query cares about the source on the right (destructive side)
 
     for (const auto &queryEdge : queryParts.joinEdges)
@@ -107,267 +133,368 @@ static void collectNewKeys(const auto &map, const std::unordered_set<const boss:
       out.insert(k);
 }
 
-// Expands uncached view sources down to their base tables for accurate comparisons
-static void expandSignature(Signature &sig, std::unordered_map<boss::Symbol, Signature> &cache,
-                            std::unordered_set<boss::Symbol> &seen) {
-  auto it = sig.viewPredicates.begin();
-  while (it != sig.viewPredicates.end()) {
-    const auto &viewName = it->first;
+void walkView(const Expression &expr, ViewMetadata &metadata) {
+  std::visit(boss::utilities::overload(
+                 [&](const ComplexExpression &ce) {
+                   if (metadata.sideEffect)
+                     return; // Short circuit if we've already detected a side effect
+
+                   const auto &head = ce.getHead();
+                   const auto &dynamics = ce.getDynamicArguments();
+
+                   if (head == "QueryView"_) {
+                     // Treat malformed QueryView as side effect
+                     if (dynamics.empty() || dynamics.size() > 3) {
+                       metadata.sideEffect = true;
+                       return;
+                     }
+
+                     const auto *viewName = std::get_if<Symbol>(&dynamics[0]);
+                     if (!viewName) {
+                       metadata.sideEffect = true;
+                       return;
+                     }
+
+                     if (dynamics.size() >= 2 && !std::get_if<bool>(&dynamics[1])) {
+                       metadata.sideEffect = true;
+                       return;
+                     }
+                     if (dynamics.size() == 3 && !std::get_if<Symbol>(&dynamics[2])) {
+                       metadata.sideEffect = true;
+                       return;
+                     }
+
+                     metadata.dependencies.insert(*viewName);
+                     return;
+                   }
+
+                   // Detect side prohibited effects
+                   if (sideEffectOperators.count(head)) {
+                     metadata.sideEffect = true;
+                     return;
+                   }
+
+                   if (head == "ByName"_) {
+                     if (dynamics.empty()) {
+                       metadata.sideEffect = true;
+                       return;
+                     }
+
+                     const auto *tableName = std::get_if<Symbol>(&dynamics[0]);
+                     if (!tableName) {
+                       metadata.sideEffect = true; // Treat malformed ByName as side effect
+                       return;
+                     }
+
+                     metadata.signature.baseTables.insert(*tableName);
+                     return;
+                   }
+
+                   if (head == "Filter"_) {
+                     if (dynamics.size() != 2) {
+                       metadata.sideEffect = true; // Treat malformed Filter as side effect
+                       return;
+                     }
+
+                     walkView(dynamics[0], metadata); // Walk source
+                     walkView(dynamics[1], metadata); // Walk predicate
+                     return;
+                   }
+
+                   if (head == "Project"_) {
+                     if (dynamics.empty()) {
+                       metadata.sideEffect = true; // Treat malformed Project as side effect
+                       return;
+                     }
+
+                     walkView(dynamics[0], metadata);
+                     metadata.signature.projectedColumns.clear();
+                     for (size_t i = 1; i < dynamics.size(); ++i) {
+                       if (const auto *s = std::get_if<Symbol>(&dynamics[i])) {
+                         metadata.signature.projectedColumns.emplace(*s, nullptr);
+                       } else if (const auto *ce = std::get_if<ComplexExpression>(&dynamics[i])) {
+                         if (ce->getHead() != "As"_) // Handle As(expr, alias) projections
+                           return;
+                         if (ce->getDynamicArguments().size() != 2) {
+                           metadata.sideEffect = true;
+                           return;
+                         }
+                         const auto *alias = std::get_if<Symbol>(&ce->getDynamicArguments()[1]);
+                         if (!alias) {
+                           metadata.sideEffect = true;
+                           return;
+                         }
+                         auto shared = std::make_shared<Expression>(
+                             ce->getDynamicArguments()[0].clone(CloneReason::EXPRESSION_WRAPPING));
+                         metadata.signature.projectedColumns.emplace(*alias, std::move(shared));
+                         walkView(ce->getDynamicArguments()[0], metadata);
+                       }
+                     }
+                     return;
+                   }
+
+                   if (auto it = joinTypeMap.find(head); it != joinTypeMap.end()) {
+                     if (dynamics.size() < 2) {
+                       metadata.sideEffect = true;
+                       return;
+                     }
+
+                     JoinType parsedJoinType = it->second;
+
+                     ViewMetadata leftMeta, rightMeta;
+                     walkView(dynamics[0], leftMeta);
+                     walkView(dynamics[1], rightMeta);
+
+                     std::unordered_set<boss::Symbol> allLefts = leftMeta.signature.baseTables;
+                     allLefts.insert(leftMeta.dependencies.begin(), leftMeta.dependencies.end());
+
+                     std::unordered_set<boss::Symbol> allRights = rightMeta.signature.baseTables;
+                     allRights.insert(rightMeta.dependencies.begin(), rightMeta.dependencies.end());
+
+                     metadata.merge(std::move(leftMeta));
+                     metadata.merge(std::move(rightMeta));
+
+                     boss::ExpressionArguments leftKeysArgs, rightKeysArgs;
+                     for (size_t i = 2; i < dynamics.size(); ++i) {
+                       const auto *pred = std::get_if<ComplexExpression>(&dynamics[i]);
+                       if (pred && pred->getHead() == "Equal"_) {
+                         const auto &args = pred->getDynamicArguments();
+                         // TODO: this assumes equi-join predicates are always Equal(leftKey,
+                         // rightKey), instead use schema information to determine which side each
+                         // key belongs to.
+                         if (args.size() == 2) {
+                           leftKeysArgs.push_back(args[0].clone(CloneReason::EXPRESSION_WRAPPING));
+                           rightKeysArgs.push_back(args[1].clone(CloneReason::EXPRESSION_WRAPPING));
+                         }
+                       } else {
+                         // It is a residual filter (or a boolean literal, etc.): assign to tables
+                         walkView(dynamics[i], metadata);
+                       }
+                     }
+
+                     // TODO: before we just had the keys as dynamics[1] and dynamics[3],
+                     // this is a patch to not rewrite the serialiser and scorer
+                     // but we should properly parse the join keys using schema information
+                     Expression leftKeys = ComplexExpression("Keys"_, {}, std::move(leftKeysArgs));
+                     Expression rightKeys =
+                         ComplexExpression("Keys"_, {}, std::move(rightKeysArgs));
+
+                     metadata.signature.joinEdges.push_back(
+                         {std::move(allLefts), std::move(allRights),
+                          std::make_shared<Expression>(std::move(leftKeys)),
+                          std::make_shared<Expression>(std::move(rightKeys)), parsedJoinType});
+                     return;
+                   }
+
+                   // Predicate conjunction operators just recurse down into the predicates
+                   if (head == "And"_) {
+                     if (dynamics.size() < 2) {
+                       metadata.sideEffect = true; // Malformed And is treated as side effect
+                       return;
+                     }
+
+                     for (const auto &arg : dynamics)
+                       walkView(arg, metadata);
+                     return;
+                   }
+
+                   if (flipComparisonOperators.count(head)) {
+                     if (dynamics.size() != 2) {
+                       metadata.sideEffect = true;
+                       return;
+                     }
+
+                     bool arg0IsSym = std::holds_alternative<Symbol>(dynamics[0]);
+                     bool arg1IsSym = std::holds_alternative<Symbol>(dynamics[1]);
+
+                     if (!arg0IsSym && !arg1IsSym) {
+                       metadata.sideEffect = true;
+                       return;
+                     }
+
+                     // Both symbols — intra-table column comparison, no flip needed
+                     if (arg0IsSym && arg1IsSym) {
+                       auto colSym0 = std::get<Symbol>(dynamics[0]);
+                       auto colSym1 = std::get<Symbol>(dynamics[1]);
+
+                       if (columnRegistry.find(colSym0) == columnRegistry.end() ||
+                           columnRegistry.find(colSym1) == columnRegistry.end()) {
+                         metadata.sideEffect = true;
+                         return;
+                       }
+
+                       auto shared =
+                           std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
+                       auto key = serializeExpr(*shared);
+
+                       metadata.signature.columnPredicates[colSym0].emplace(key, shared);
+                       metadata.signature.columnPredicates[colSym1].emplace(std::move(key),
+                                                                            std::move(shared));
+                       return;
+                     }
+
+                     // One symbol, one literal — canonicalise so column is always on the left
+                     bool needsFlip = arg1IsSym && !arg0IsSym;
+
+                     auto colSym = std::get<Symbol>(needsFlip ? dynamics[1] : dynamics[0]);
+
+                     if (columnRegistry.find(colSym) == columnRegistry.end()) {
+                       metadata.sideEffect = true;
+                       return;
+                     }
+
+                     if (needsFlip) {
+                       boss::Symbol canonicalHead = flipComparisonOperators.at(head);
+                       boss::ExpressionArguments canonArgs;
+                       canonArgs.push_back(dynamics[1].clone(CloneReason::EXPRESSION_WRAPPING));
+                       canonArgs.push_back(dynamics[0].clone(CloneReason::EXPRESSION_WRAPPING));
+                       ComplexExpression canonicalExpr(canonicalHead, {}, std::move(canonArgs), {});
+                       auto shared = std::make_shared<Expression>(std::move(canonicalExpr));
+                       auto key = serializeExpr(*shared);
+                       metadata.signature.columnPredicates[colSym].emplace(std::move(key),
+                                                                           std::move(shared));
+                     } else {
+                       auto shared =
+                           std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
+                       auto key = serializeExpr(*shared);
+                       metadata.signature.columnPredicates[colSym].emplace(std::move(key),
+                                                                           std::move(shared));
+                     }
+                     return;
+                   }
+
+                   // Strict First-Argument Operators
+                   if (strictComparisonOperators.count(head)) {
+                     if (dynamics.empty() || !std::holds_alternative<Symbol>(dynamics[0])) {
+                       metadata.sideEffect = true;
+                       return;
+                     }
+
+                     auto colSym = std::get<Symbol>(dynamics[0]);
+
+                     // Malformation Check: Ensure the symbol is actually a column
+                     if (columnRegistry.find(colSym) == columnRegistry.end()) {
+                       metadata.sideEffect = true;
+                       return;
+                     }
+
+                     auto shared =
+                         std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
+                     auto key = serializeExpr(*shared);
+
+                     metadata.signature.columnPredicates[colSym].emplace(std::move(key),
+                                                                         std::move(shared));
+                     return;
+                   }
+
+                   // TODO: handle aggregations
+                   // For now it's with the passthroughs like ordering operators
+                   if (head == "GroupBy"_ || head == "OrderBy"_ || head == "Slice"_) {
+                     if (dynamics.empty()) {
+                       // Treat malformed passthrough operators as side effect
+                       metadata.sideEffect = true;
+                     }
+                     for (size_t i = 0; i < dynamics.size(); ++i) {
+                       walkView(dynamics[i], metadata);
+                     }
+                     return;
+                   }
+
+                   for (const auto &arg : dynamics) {
+                     walkView(arg, metadata);
+                   }
+                 },
+                 [&](const Symbol &s) {
+                   if (tableRegistry.count(s))
+                     metadata.signature.baseTables.insert(s);
+                 },
+                 [](const auto &) {}),
+             expr);
+}
+
+// Expands view sources down to their base tables for accurate comparisons
+void expandSignature(ViewMetadata &metadata, std::unordered_map<boss::Symbol, ViewMetadata> &cache,
+                     std::unordered_set<boss::Symbol> &seen) {
+  for (const auto &viewName : metadata.dependencies) {
     auto regIt = viewRegistry.find(viewName);
-    if (regIt == viewRegistry.end() || regIt->second.cached.has_value() || seen.count(viewName)) {
-      ++it;
+    if (regIt == viewRegistry.end() || seen.count(viewName))
       continue;
-    }
+
     seen.insert(viewName);
     if (!cache.count(viewName)) {
-      cache[viewName] = regIt->second.signature; // Cache signatures of views we've expanded to
-                                                 // avoid redundant work and infinite recursion on
-                                                 // cycles  expandSignature(cache[viewName], cache);
-      expandSignature(cache[viewName], cache, seen);
+      // Cache signatures of views we've expanded to
+      // avoid redundant work and infinite recursion on
+      // cycles  expandSignature(cache[viewName], cache);
+      auto &cached = cache[viewName];
+      cached.signature = regIt->second.signature;
+      cached.dependencies = regIt->second.dependencies;
+      expandSignature(cached, cache, seen);
     }
-    auto &viewSig = cache[viewName];
 
-    // merge tablePredicates
-    for (auto &[table, preds] : viewSig.tablePredicates)
-      for (auto &[key, expr] : preds)
-        sig.tablePredicates[table].emplace(key, expr);
+    auto &viewMeta = cache[viewName];
 
-    // merge remaining viewPredicates (cached views referenced inside the expanded view)
-    for (auto &[view, preds] : viewSig.viewPredicates)
-      for (auto &[key, expr] : preds)
-        sig.viewPredicates[view].emplace(key, expr);
+    // Merge dependencies
+    metadata.dependencies.insert(viewMeta.dependencies.begin(), viewMeta.dependencies.end());
 
-    // expand view name in join edges
-    for (auto &edge : sig.joinEdges) {
+    // Merge column predicates
+    for (auto &[col, preds] : viewMeta.signature.columnPredicates)
+      metadata.signature.columnPredicates[col].merge(preds);
+
+    // Merge base tables
+    metadata.signature.baseTables.insert(viewMeta.signature.baseTables.begin(),
+                                         viewMeta.signature.baseTables.end());
+
+    // Expand view name in join edges - replace view name with its base tables and remaining
+    // dependencies in the sources
+    for (auto &edge : metadata.signature.joinEdges) {
       bool wasLeft = edge.leftSources.erase(viewName);
       bool wasRight = edge.rightSources.erase(viewName);
       if (!wasLeft && !wasRight)
         continue;
-      for (const auto &[table, _] : viewSig.tablePredicates) {
+      for (const auto &table : viewMeta.signature.baseTables) {
         if (wasLeft)
           edge.leftSources.insert(table);
         if (wasRight)
           edge.rightSources.insert(table);
       }
-      for (const auto &[view, _] : viewSig.viewPredicates) {
+      for (const auto &dep : viewMeta.dependencies) {
         if (wasLeft)
-          edge.leftSources.insert(view);
+          edge.leftSources.insert(dep);
         if (wasRight)
-          edge.rightSources.insert(view);
+          edge.rightSources.insert(dep);
       }
     }
 
-    for (auto &edge : viewSig.joinEdges)
-      sig.joinEdges.push_back(edge);
-
-    it = sig.viewPredicates.erase(it);
+    for (auto &edge : viewMeta.signature.joinEdges)
+      metadata.signature.joinEdges.push_back(edge);
   }
-}
-
-void walkView(const Expression &expr, ViewMetadata &metadata) {
-  std::visit(
-      boss::utilities::overload(
-          [&](const ComplexExpression &ce) {
-            if (metadata.sideEffect)
-              return; // Short circuit if we've already detected a side effect
-
-            const auto &head = ce.getHead();
-            const auto &dynamics = ce.getDynamicArguments();
-
-            if (head == "QueryView"_) {
-              // Treat malformed QueryView as side effect
-              if (dynamics.empty() || dynamics.size() > 3) {
-                metadata.sideEffect = true;
-                return;
-              }
-
-              const auto *viewName = std::get_if<Symbol>(&dynamics[0]);
-              if (!viewName) {
-                metadata.sideEffect = true;
-                return;
-              }
-
-              if (dynamics.size() >= 2 && !std::get_if<bool>(&dynamics[1])) {
-                metadata.sideEffect = true;
-                return;
-              }
-              if (dynamics.size() == 3 && !std::get_if<Symbol>(&dynamics[2])) {
-                metadata.sideEffect = true;
-                return;
-              }
-
-              metadata.dependencies.insert(*viewName);
-              metadata.signature.viewPredicates.try_emplace(*viewName);
-              return;
-            }
-
-            // Detect side prohibited effects
-            if (sideEffectOperators.count(head)) {
-              metadata.sideEffect = true;
-              return;
-            }
-
-            if (head == "ByName"_) {
-              if (dynamics.empty()) {
-                metadata.sideEffect = true;
-                return;
-              }
-
-              const auto *tableName = std::get_if<Symbol>(&dynamics[0]);
-              if (!tableName) {
-                metadata.sideEffect = true; // Treat malformed ByName as side effect
-                return;
-              }
-
-              metadata.signature.tablePredicates.try_emplace(*tableName);
-              return;
-            }
-
-            if (head == "Filter"_) {
-              if (dynamics.size() != 2) {
-                metadata.sideEffect = true; // Treat malformed Filter as side effect
-                return;
-              }
-
-              walkView(dynamics[0], metadata);
-
-              // TODO: predicates are assigned to all sources in the subtree because we
-              // lack schema information to determine which table owns which column. This
-              // causes false positives in scoring — a view filtering orders on l_price
-              // would incorrectly pass condition 2 because the query's predicate map also
-              // has l_price on orders after the join. Fix: load table schemas and resolve
-              // column-to-table ownership before assignment.
-              assignPredicateToSources(dynamics[1].clone(CloneReason::EXPRESSION_WRAPPING),
-                                       metadata);
-              return;
-            }
-
-            if (head == "Project"_) {
-              if (dynamics.empty()) {
-                metadata.sideEffect = true; // Treat malformed Project as side effect
-                return;
-              }
-
-              walkView(dynamics[0], metadata);
-              for (size_t i = 1; i < dynamics.size(); ++i) {
-                walkView(dynamics[i], metadata);
-                auto key = serializeExpr(dynamics[i]);
-                auto shared = std::make_shared<Expression>(
-                    dynamics[i].clone(CloneReason::EXPRESSION_WRAPPING));
-                metadata.signature.projectedColumns.emplace(std::move(key), std::move(shared));
-              }
-              return;
-            }
-
-            if (auto it = joinTypeMap.find(head); it != joinTypeMap.end()) {
-              if (dynamics.size() < 2) {
-                metadata.sideEffect = true; // Treat malformed Joins as side effect
-                return;
-              }
-
-              JoinType parsedJoinType = it->second;
-              std::unordered_set<boss::Symbol> allLefts, allRights;
-
-              auto tablePointersBefore = snapshotKeys(metadata.signature.tablePredicates);
-              auto viewPointersBefore = snapshotKeys(metadata.signature.viewPredicates);
-              walkView(dynamics[0], metadata);
-              collectNewKeys(metadata.signature.tablePredicates, tablePointersBefore, allLefts);
-              collectNewKeys(metadata.signature.viewPredicates, viewPointersBefore, allLefts);
-
-              auto tablePointersMid = snapshotKeys(metadata.signature.tablePredicates);
-              auto viewPointersMid = snapshotKeys(metadata.signature.viewPredicates);
-              walkView(dynamics[1], metadata);
-              collectNewKeys(metadata.signature.tablePredicates, tablePointersMid, allRights);
-              collectNewKeys(metadata.signature.viewPredicates, viewPointersMid, allRights);
-
-              boss::ExpressionArguments leftKeysArgs, rightKeysArgs;
-              for (size_t i = 2; i < dynamics.size(); ++i) {
-                const auto *pred = std::get_if<ComplexExpression>(&dynamics[i]);
-                if (pred && pred->getHead() == "Equal"_) {
-                  const auto &args = pred->getDynamicArguments();
-                  // TODO: this assumes equi-join predicates are always Equal(leftKey, rightKey),
-                  // instead use schema information to determine which side each key belongs to.
-                  if (args.size() == 2) {
-                    leftKeysArgs.push_back(args[0].clone(CloneReason::EXPRESSION_WRAPPING));
-                    rightKeysArgs.push_back(args[1].clone(CloneReason::EXPRESSION_WRAPPING));
-                  }
-                } else {
-                  // It is a residual filter (or a boolean literal, etc.): assign to tables
-                  assignPredicateToSources(dynamics[i].clone(CloneReason::EXPRESSION_WRAPPING),
-                                           metadata);
-                }
-              }
-
-              // TODO: before we just had the keys as dynamics[1] and dynamics[3],
-              // this is a patch to not rewrite the serialiser and scorer
-              // but we should properly parse the join keys using schema information
-              Expression leftKeys = ComplexExpression("Keys"_, {}, std::move(leftKeysArgs));
-              Expression rightKeys = ComplexExpression("Keys"_, {}, std::move(rightKeysArgs));
-
-              metadata.signature.joinEdges.push_back(
-                  {std::move(allLefts), std::move(allRights),
-                   std::make_shared<Expression>(std::move(leftKeys)),
-                   std::make_shared<Expression>(std::move(rightKeys)), parsedJoinType});
-              return;
-            }
-
-            // TODO: handle aggregations
-            // For now it's with the passthroughs like ordering operators
-            if (head == "GroupBy"_ || head == "OrderBy"_ || head == "Slice"_) {
-              if (dynamics.empty()) {
-                // Treat malformed passthrough operators as side effect
-                metadata.sideEffect = true;
-              }
-              for (size_t i = 0; i < dynamics.size(); ++i) {
-                walkView(dynamics[i], metadata);
-              }
-              return;
-            }
-
-            for (const auto &arg : dynamics) {
-              walkView(arg, metadata);
-            }
-          },
-          [&](const Symbol &s) {
-            if (tableRegistry.count(s))
-              metadata.signature.tablePredicates.try_emplace(s);
-
-            auto it = columnRegistry.find(s);
-            if (it == columnRegistry.end())
-              return;
-            for (const auto &table : it->second)
-              if (metadata.signature.tablePredicates.count(table))
-                metadata.referencedTableColumns[table].insert(s);
-          },
-          [](const auto &) {}),
-      expr);
 }
 
 double scoreView(const Signature &viewParts, const Signature &queryParts) {
   // Condition 1: view must share at least one table with the query
   size_t commonTables = 0;
-  for (const auto &[table, _] : viewParts.tablePredicates)
-    if (queryParts.tablePredicates.count(table))
+  for (const auto &table : viewParts.baseTables)
+    if (queryParts.baseTables.count(table))
       ++commonTables;
 
   if (commonTables == 0)
     return -1.0;
 
-  double tableCoverage = (double)commonTables / (double)queryParts.tablePredicates.size();
+  double tableCoverage = (double)commonTables / (double)queryParts.baseTables.size();
 
   // Condition 2: the view must have weaker predicates than the query on shared tables
   size_t totalQueryPreds = 0;
   size_t coveredQueryPreds = 0;
 
-  for (const auto &[table, viewPreds] : viewParts.tablePredicates) {
-    auto qIt = queryParts.tablePredicates.find(table);
-    // View applies predicates on a table the query doesn't reference;
+  for (const auto &[col, viewPreds] : viewParts.columnPredicates) {
+    auto qIt = queryParts.columnPredicates.find(col);
+    // View applies predicates on a column the query doesn't;
     // any filtering here silently restricts the result the query sees.
-    if (qIt == queryParts.tablePredicates.end()) {
-      if (!viewPreds.empty())
-        return -1.0;
-      continue;
-    }
+    // TODO: Semantic reasoning needed with knowledge of the actual data
+    // if a predicate does not affect the data at all (e.g. Greater(l_price, -1) when l_price is
+    // always positive) then this is not a coverage failure
+    if (qIt == queryParts.columnPredicates.end())
+      return -1.0;
 
     const auto &queryPreds = qIt->second;
     for (const auto &[key, _] : viewPreds)
@@ -386,8 +513,8 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
         ++coveredQueryPreds;
   }
 
-  for (const auto &[table, queryPreds] : queryParts.tablePredicates)
-    if (!viewParts.tablePredicates.count(table))
+  for (const auto &[col, queryPreds] : queryParts.columnPredicates)
+    if (!viewParts.columnPredicates.count(col))
       totalQueryPreds += queryPreds.size();
 
   double predicateCoverage =
@@ -427,12 +554,17 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
   double projectionCoverage = 1.0;
   if (!viewParts.projectedColumns.empty() && !queryParts.projectedColumns.empty()) {
     size_t matched = 0;
-    for (const auto &[key, _] : queryParts.projectedColumns)
-      if (viewParts.projectedColumns.count(key))
-        ++matched;
-    if (matched < queryParts.projectedColumns.size())
-      return -1.0; // View does not cover all projected columns the query needs
-
+    for (const auto &[col, queryExpr] : queryParts.projectedColumns) {
+      auto it = viewParts.projectedColumns.find(col);
+      if (it == viewParts.projectedColumns.end()) {
+        // TODO: check if any view projection has the same underlying expression but a different
+        // name — if so, a rename Project on top of the view could satisfy the query (partial match)
+        return -1.0;
+      }
+      if (it->second && queryExpr && serializeExpr(*it->second) != serializeExpr(*queryExpr))
+        return -1.0;
+      ++matched;
+    }
     // Score is how many more columns the view projects on top of what the query needs,
     // as a fraction of the query's projections
     projectionCoverage =
@@ -451,8 +583,9 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
          W_PROJ * projectionCoverage;
 }
 
-std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata &queryMetadata) {
-  // Only attempt rewriting if the top-level operator is one we support rewriting for
+std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata &queryMetadata,
+                                          std::unordered_map<boss::Symbol, ViewMetadata> &cache,
+                                          std::unordered_set<boss::Symbol> &seen) {
   auto *ce = std::get_if<ComplexExpression>(&query);
   if (!ce || !rewritableOperators.count(ce->getHead()))
     return std::nullopt;
@@ -460,22 +593,16 @@ std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata 
   if (queryMetadata.sideEffect)
     return std::nullopt;
 
-  // TODO: explore having a cross-query cache (goes together with the tableToViews TODO)
-  // Cache for expanded view signatures
-  std::unordered_map<boss::Symbol, Signature> cache;
-  // Track seen views to avoid merging the same view signature multiple times
-  std::unordered_set<boss::Symbol> seen;
-  // Expand query signature in place - resolves uncached view references to their base tables
-  expandSignature(queryMetadata.signature, cache, seen);
-
   // TODO: look into building a complete reverse index of base table -> top level views that
   // reference it at define time to nuke the search space instead of scanning all views
   for (const auto &[name, entry] : viewRegistry) {
-    Signature viewSig = entry.signature;
+    ViewMetadata viewMeta;
+    viewMeta.signature = entry.signature;
+    viewMeta.dependencies = entry.dependencies;
     seen.clear();
-    expandSignature(viewSig, cache, seen);
+    expandSignature(viewMeta, cache, seen);
 
-    double score = scoreView(viewSig, queryMetadata.signature);
+    double score = scoreView(viewMeta.signature, queryMetadata.signature);
     // TODO: consider non-perfect matches and extract remainder to apply on top of the view
     if (score >= 1.0)
       return name;

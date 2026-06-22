@@ -13,15 +13,27 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
     // Extract expression metadata always
     walkView(e, metadata);
 
+    // TODO: explore having a cross-query cache (goes together with the tableToViews TODO)
+    // Cache for expanded view signatures
+    std::unordered_map<boss::Symbol, ViewMetadata> cache;
+    // Track seen views to avoid merging the same view signature multiple times
+    std::unordered_set<boss::Symbol> seen;
+    // Expand query signature in place - resolves uncached view references to their base tables
+    expandSignature(metadata, cache, seen);
+
     if (topLevel) {
       queryMetadata = &metadata;
+      queryMetadata->signature.extractAllReferencedColumns(queryMetadata->referencedColumns);
     }
 
-    if (auto match = findRewriting(e, metadata)) {
+    if (auto match = findRewriting(e, metadata, cache, seen)) {
+      // Clear referenced columns if the view definition needs more than what the query needs
+      // TODO: re-extract from view definition for proper pruning
+      queryMetadata->referencedColumns.clear();
       boss::ExpressionArguments args;
       args.emplace_back(Symbol(*match));
       auto rewritten = Expression(ComplexExpression("QueryView"_, {}, std::move(args), {}));
-      return evaluate(std::move(rewritten), queryMetadata, skipRewrite, topLevel);
+      return evaluate(std::move(rewritten), queryMetadata);
     }
   }
 
@@ -44,6 +56,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 return Expression(false); // DefineView requires a symbol for the view name
               auto viewName = std::move(*name);
 
+              // TODO: use metadata from the top instead of re-walking the view definition
               ViewMetadata metadata;
               walkView(dynamics[1], metadata); // Walk the view expression to collect data for
                                                // dependency graph construction and validation
@@ -63,7 +76,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
 
               // Remove old index entries if view already exists
               if (auto existing = viewRegistry.find(viewName); existing != viewRegistry.end()) {
-                for (const auto &[tableName, _] : existing->second.signature.tablePredicates)
+                for (const auto &tableName : existing->second.signature.baseTables)
                   tableToViews[tableName].erase(viewName);
                 for (const auto &dep : existing->second.dependencies)
                   viewToViews[dep].erase(viewName);
@@ -75,7 +88,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               // efficient candidate lookup instead of scanning the full registry. Same DFS pass
               // could replace hasCycle traversal above, doing cycle detection and index building in
               // one walk.
-              for (const auto &[tableName, _] : metadata.signature.tablePredicates)
+              for (const auto &tableName : metadata.signature.baseTables)
                 tableToViews[tableName].insert(viewName);
               for (const auto &dep : metadata.dependencies)
                 viewToViews[dep].insert(viewName);
@@ -87,6 +100,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               return Expression(true);
             }
 
+            // TODO: make this transparent as well
             if (head == "QueryView"_) {
               if (dynamics.size() < 1 || dynamics.size() > 3)
                 throw std::runtime_error("QueryView requires 1 to 3 arguments");
@@ -258,7 +272,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 return Expression(false); // Dropping a non-existent view fails gracefully
 
               // Cleanup indexes
-              for (const auto &[tableName, _] : it->second.signature.tablePredicates)
+              for (const auto &tableName : it->second.signature.baseTables)
                 tableToViews[tableName].erase(viewName);
               for (const auto &dep : it->second.dependencies)
                 viewToViews[dep].erase(viewName);
@@ -399,16 +413,12 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
             auto const &entry = it->second;
 
             boss::ExpressionArguments colArgs;
-            const std::unordered_set<Symbol> *referencedColumns = nullptr;
-            if (queryMetadata && !queryMetadata->signature.projectedColumns.empty())
-              if (auto it = queryMetadata->referencedTableColumns.find(s);
-                  it != queryMetadata->referencedTableColumns.end())
-                referencedColumns = &it->second;
-
-            for (auto const &col : entry.columns)
-              if (!referencedColumns || referencedColumns->count(col))
-                colArgs.emplace_back(col); // Follow schema ordering for columns in the Gather args
-
+            if (!queryMetadata->referencedColumns.empty()) {
+              for (auto const &col : entry.columns)
+                if (queryMetadata->referencedColumns.count(col))
+                  // Follow schema ordering for columns in the Gather args
+                  colArgs.emplace_back(col);
+            }
             boss::ExpressionArguments gatherArgs;
             gatherArgs.emplace_back(entry.url);
             gatherArgs.emplace_back(entry.loaderPath);
