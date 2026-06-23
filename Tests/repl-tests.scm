@@ -640,7 +640,7 @@
   (ve-eval (ClearViews))
 
   (test "Lazy table symbol rewrites to Gather"
-        '(Gather "/data/sub_lazy.tbl" "/lib/loader.so" (Table) (List sub_col_a sub_col_b))
+        '(Gather "/data/sub_lazy.tbl" "/lib/loader.so" (Table) (List))
         (begin
           (ve-eval (ClearTables))
           (ve-eval (RegisterTable sub_lazy "/data/sub_lazy.tbl" "/lib/loader.so" #t sub_col_a sub_col_b))
@@ -660,7 +660,7 @@
           (ve-eval sub_unknown)))
 
   (test "Lazy table symbol inside expression gets rewritten"
-        '(Filter (Gather "/data/sub_filter.tbl" "/lib/loader.so" (Table) (List sub_filter_col)) (Greater sub_filter_col 5))
+        '(Filter (Gather "/data/sub_filter.tbl" "/lib/loader.so" (Table) (List)) (Greater sub_filter_col 5))
         (begin
           (ve-eval (ClearTables))
           (ve-eval (RegisterTable sub_filter "/data/sub_filter.tbl" "/lib/loader.so" #t sub_filter_col))
@@ -695,7 +695,7 @@
   (ve-eval (ClearTables))
 
   (test "Filter without Project gathers all columns"
-      '(Filter (Gather "/data/cp.tbl" "/lib/loader.so" (Table) (List cp_a cp_b cp_c)) (Greater cp_a 1))
+      '(Filter (Gather "/data/cp.tbl" "/lib/loader.so" (Table) (List)) (Greater cp_a 1))
       (begin
         (ve-eval (RegisterTable cp_tbl "/data/cp.tbl" "/lib/loader.so" #t cp_a cp_b cp_c))
         (ve-eval (Filter cp_tbl (Greater cp_a 1)))))
@@ -715,7 +715,7 @@
           (ve-eval (Project (Filter cp3_tbl (Greater cp3_b 5)) cp3_a))))
 
   (test "No projections falls back to all columns"
-        '(Gather "/data/cp4.tbl" "/lib/loader.so" (Table) (List cp4_a cp4_b cp4_c))
+        '(Gather "/data/cp4.tbl" "/lib/loader.so" (Table) (List))
         (begin
           (ve-eval (ClearTables))
           (ve-eval (RegisterTable cp4_tbl "/data/cp4.tbl" "/lib/loader.so" #t cp4_a cp4_b cp4_c))

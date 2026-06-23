@@ -325,6 +325,39 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               return Expression(ComplexExpression("ViewList"_, {}, std::move(columns), {}));
             }
 
+            if (head == "Name"_) {
+              if (dynamics.size() != 2)
+                return Expression(false);
+
+              auto *loadExpr = std::get_if<ComplexExpression>(&dynamics[0]);
+              if (!loadExpr || loadExpr->getHead() != "Load"_)
+                return Expression(false);
+
+              auto const &loadArgs = loadExpr->getDynamicArguments();
+              if (loadArgs.empty())
+                return Expression(false);
+
+              auto const *path = std::get_if<std::string>(&loadArgs[0]);
+              auto const *tableName = std::get_if<Symbol>(&dynamics[1]);
+              if (path && tableName) {
+                std::vector<boss::Symbol> columns;
+                bool valid = true;
+                for (size_t i = 1; i < loadArgs.size(); ++i) {
+                  auto const *col = std::get_if<Symbol>(&loadArgs[i]);
+                  if (!col) {
+                    valid = false;
+                    break;
+                  }
+                  columns.push_back(*col);
+                }
+                if (valid)
+                  registerTable(*tableName, *path, "", false, std::move(columns));
+              }
+
+              return Expression(ComplexExpression(std::move(head), std::move(statics),
+                                                  std::move(dynamics), std::move(spans)));
+            }
+
             if (head == "RegisterTable"_) {
               if (!topLevel)
                 return Expression(false);
@@ -413,7 +446,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
             auto const &entry = it->second;
 
             boss::ExpressionArguments colArgs;
-            if (!queryMetadata->referencedColumns.empty()) {
+            if (!queryMetadata->referencedColumns.empty() && !queryMetadata->signature.projectedColumns.empty()) {
               for (auto const &col : entry.columns)
                 if (queryMetadata->referencedColumns.count(col))
                   // Follow schema ordering for columns in the Gather args

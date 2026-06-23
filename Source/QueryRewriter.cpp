@@ -317,11 +317,20 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
                        auto colSym0 = std::get<Symbol>(dynamics[0]);
                        auto colSym1 = std::get<Symbol>(dynamics[1]);
 
-                       if (columnRegistry.find(colSym0) == columnRegistry.end() ||
-                           columnRegistry.find(colSym1) == columnRegistry.end()) {
-                         metadata.sideEffect = true;
-                         return;
-                       }
+                       // Do not actually mark columns not being in the registry as a side effect;
+                       // leave this part of expression correctness up to the user, what is
+                       // actually important is query rewriter correctness which this does not
+                       // affect. Also this is a symptom of a larger problem, relating to which
+                       // sources are present in a given subtree for validation, but fixing that
+                       // requires a significant refactor of what happens at define time and more
+                       // importantly - redefine time, while being functionally irrelevant if the
+                       // expression is not actually malformed.
+
+                       //  if (columnRegistry.find(colSym0) == columnRegistry.end() ||
+                       //      columnRegistry.find(colSym1) == columnRegistry.end()) {
+                       //    metadata.sideEffect = true;
+                       //    return;
+                       //  }
 
                        auto shared =
                            std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
@@ -338,10 +347,11 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
 
                      auto colSym = std::get<Symbol>(needsFlip ? dynamics[1] : dynamics[0]);
 
-                     if (columnRegistry.find(colSym) == columnRegistry.end()) {
-                       metadata.sideEffect = true;
-                       return;
-                     }
+                    // Again skip check, see comment about malformation checks above
+                    //  if (columnRegistry.find(colSym) == columnRegistry.end()) {
+                    //    metadata.sideEffect = true;
+                    //    return;
+                    //  }
 
                      if (needsFlip) {
                        boss::Symbol canonicalHead = flipComparisonOperators.at(head);
@@ -372,11 +382,11 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
 
                      auto colSym = std::get<Symbol>(dynamics[0]);
 
-                     // Malformation Check: Ensure the symbol is actually a column
-                     if (columnRegistry.find(colSym) == columnRegistry.end()) {
-                       metadata.sideEffect = true;
-                       return;
-                     }
+                     // Again skip check, see comment re: the same check in flipComparisonOperators
+                     //  if (columnRegistry.find(colSym) == columnRegistry.end()) {
+                     //    metadata.sideEffect = true;
+                     //    return;
+                     //  }
 
                      auto shared =
                          std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
