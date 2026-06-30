@@ -100,7 +100,6 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               return Expression(true);
             }
 
-            // TODO: make this transparent as well
             if (head == "QueryView"_) {
               if (dynamics.size() < 1 || dynamics.size() > 3)
                 throw std::runtime_error("QueryView requires 1 to 3 arguments");
@@ -439,14 +438,24 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                                                 std::move(dynamics), std::move(spans)));
           },
           [queryMetadata](Symbol &&s) -> Expression {
-            auto it = tableRegistry.find(s);
-            if (it == tableRegistry.end() || !it->second.lazy)
+            auto viewIt = viewRegistry.find(s);
+            if (viewIt != viewRegistry.end()) {
+              boss::ExpressionArguments queryViewArgs;
+              queryViewArgs.emplace_back(std::move(s));
+              // TODO: implement adaptive caching
+              auto rewritten = Expression(ComplexExpression("QueryView"_, {}, std::move(queryViewArgs), {}));
+              return evaluate(std::move(rewritten), queryMetadata);
+            }
+
+            auto tableIt = tableRegistry.find(s);
+            if (tableIt == tableRegistry.end() || !tableIt->second.lazy)
               return Expression(std::move(s));
 
-            auto const &entry = it->second;
+            auto const &entry = tableIt->second;
 
             boss::ExpressionArguments colArgs;
-            if (!queryMetadata->referencedColumns.empty() && !queryMetadata->signature.projectedColumns.empty()) {
+            if (!queryMetadata->referencedColumns.empty() &&
+                !queryMetadata->signature.projectedColumns.empty()) {
               for (auto const &col : entry.columns)
                 if (queryMetadata->referencedColumns.count(col))
                   // Follow schema ordering for columns in the Gather args

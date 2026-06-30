@@ -689,6 +689,59 @@
           (ve-eval (ClearTables))
           (ve-eval sub_cleared))))
 
+
+(test-group "Transparent view symbol replacement"
+
+  (ve-eval (ClearViews))
+
+  (test "Bare view symbol resolves same as QueryView"
+        '(Table (A 1 2 3))
+        (begin
+          (ve-eval (DefineView vs_simple (Table (A 1 2 3))))
+          (ve-eval vs_simple)))
+
+  (test "Bare view symbol with non-trivial definition resolves"
+        '(Filter (Table (A 1 2 3)) (Greater A 1))
+        (begin
+          (ve-eval (DefineView vs_filtered (Filter (Table (A 1 2 3)) (Greater A 1))))
+          (ve-eval vs_filtered)))
+
+  (test "Bare view symbol as argument to outer expression"
+        '(Filter (Table (A 1 2 3)) (Greater A 1))
+        (begin
+          (ve-eval (DefineView vs_inner (Table (A 1 2 3))))
+          (ve-eval (Filter vs_inner (Greater A 1)))))
+
+  (test "View shadows same-named lazy table"
+        '(Table (A 99))
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable vs_shadow "/data/vs_shadow.tbl" "/lib/loader.so" #t vs_shadow_col))
+          (ve-eval (DefineView vs_shadow (Table (A 99))))
+          (ve-eval vs_shadow)))
+
+  (test "After DropView bare symbol passes through unchanged"
+        'vs_dropped
+        (begin
+          (ve-eval (DefineView vs_dropped (Table (A 1 2 3))))
+          (ve-eval (DropView vs_dropped))
+          (ve-eval vs_dropped)))
+
+  (test "After ClearViews bare symbol passes through unchanged"
+        'vs_cleared
+        (begin
+          (ve-eval (DefineView vs_cleared (Table (A 1 2 3))))
+          (ve-eval (ClearViews))
+          (ve-eval vs_cleared)))
+
+  (test "Redefined view bare symbol reflects new definition"
+        '(Table (A 99))
+        (begin
+          (ve-eval (DefineView vs_redef (Table (A 1 2 3))))
+          (ve-eval (DefineView vs_redef (Table (A 99))))
+          (ve-eval vs_redef))))
+
+
 (test-group "Column pruning"
 
   (ve-eval (ClearViews))
