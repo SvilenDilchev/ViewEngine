@@ -347,11 +347,11 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
 
                      auto colSym = std::get<Symbol>(needsFlip ? dynamics[1] : dynamics[0]);
 
-                    // Again skip check, see comment about malformation checks above
-                    //  if (columnRegistry.find(colSym) == columnRegistry.end()) {
-                    //    metadata.sideEffect = true;
-                    //    return;
-                    //  }
+                     // Again skip check, see comment about malformation checks above
+                     //  if (columnRegistry.find(colSym) == columnRegistry.end()) {
+                     //    metadata.sideEffect = true;
+                     //    return;
+                     //  }
 
                      if (needsFlip) {
                        boss::Symbol canonicalHead = flipComparisonOperators.at(head);
@@ -563,7 +563,6 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
   // Condition 4: the view must project at least all the columns the query projects
   double projectionCoverage = 1.0;
   if (!viewParts.projectedColumns.empty() && !queryParts.projectedColumns.empty()) {
-    size_t matched = 0;
     for (const auto &[col, queryExpr] : queryParts.projectedColumns) {
       auto it = viewParts.projectedColumns.find(col);
       if (it == viewParts.projectedColumns.end()) {
@@ -573,20 +572,48 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
       }
       if (it->second && queryExpr && serializeExpr(*it->second) != serializeExpr(*queryExpr))
         return -1.0;
-      ++matched;
     }
     // Score is how many more columns the view projects on top of what the query needs,
     // as a fraction of the query's projections
     projectionCoverage =
         (double)queryParts.projectedColumns.size() / (double)viewParts.projectedColumns.size();
   } else if (!viewParts.projectedColumns.empty() && queryParts.projectedColumns.empty()) {
-    // TODO: without schema information we cannot verify the view's projections cover
-    // everything the query needs — pessimistically reject until schema is available.
-    return -1.0;
+    std::unordered_set<boss::Symbol> queryColumns;
+    for (const auto &table : queryParts.baseTables) {
+      const auto &entry = tableRegistry.find(table);
+      if (entry == tableRegistry.end())
+        return -1.0; // Pessimistically reject if we cannot find the table in the registry
+      for (const auto &col : entry->second.columns) {
+        const auto it = viewParts.projectedColumns.find(col);
+        if (it == viewParts.projectedColumns.end())
+          return -1.0; // View doesn't project a column the query needs
+        if (it->second)
+          return -1.0; // If matched against column is computed, reject as the query wants a base
+                       // column (no projections)
+        queryColumns.insert(col);
+      }
+    }
+    projectionCoverage = (double)queryColumns.size() / (double)viewParts.projectedColumns.size();
   } else if (viewParts.projectedColumns.empty() && !queryParts.projectedColumns.empty()) {
     // View returns all base columns but query needs specific projected columns.
-    // Without schema info we cannot verify coverage — pessimistically reject.
-    return -1.0;
+    std::unordered_set<boss::Symbol> viewColumns;
+    for (const auto &table : viewParts.baseTables) {
+      const auto &entry = tableRegistry.find(table);
+      if (entry == tableRegistry.end())
+        return -1.0; // Pessimistically reject if we cannot find the table in the registry
+      viewColumns.insert(entry->second.columns.begin(), entry->second.columns.end());
+    }
+    for (const auto &[col, expr] : queryParts.projectedColumns) {
+      if (expr)
+        return -1.0; // TODO: Have to check if the expression can be computed (partial matching)
+                     // from the base columns, as there is no projected column to match against.
+      else if (!viewColumns.count(col))
+        return -1.0; // View doesn't project a column the query needs
+    }
+
+    projectionCoverage = viewColumns.size() > 0 ? (double)queryParts.projectedColumns.size() /
+                                                      (double)viewColumns.size()
+                                                : -1.0;
   }
 
   return W_TABLE * tableCoverage + W_PRED * predicateCoverage + W_JOIN * joinCoverage +
