@@ -1,6 +1,7 @@
 #include "QueryRewriter.hpp"
 #include "MetadataRegistry.hpp"
 #include "ViewRegistry.hpp"
+#include <unordered_map>
 #include <unordered_set>
 
 using boss::expressions::CloneReason;
@@ -44,6 +45,18 @@ static std::string serializeExpr(const Expression &expr) {
                         [](const std::string &s) { return "\"" + s + "\""; },
                         [](const auto &v) { return std::to_string(v); }),
                     expr);
+}
+
+// Returns a sorted vector of source names for a given set of sources, used for canonicalising
+// join edges for comparison and scoring
+static std::vector<std::string>
+canonicalSourceKey(const std::unordered_set<boss::Symbol> &sources) {
+  std::vector<std::string> names;
+  names.reserve(sources.size());
+  for (const auto &s : sources)
+    names.push_back(s.getName());
+  std::sort(names.begin(), names.end());
+  return names;
 }
 
 // Helper function to extract column symbols
@@ -254,7 +267,7 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
                      metadata.merge(std::move(leftMeta));
                      metadata.merge(std::move(rightMeta));
 
-                     boss::ExpressionArguments leftKeysArgs, rightKeysArgs;
+                     std::vector<std::pair<Expression, Expression>> keyPairs;
                      for (size_t i = 2; i < dynamics.size(); ++i) {
                        const auto *pred = std::get_if<ComplexExpression>(&dynamics[i]);
                        if (pred && pred->getHead() == "Equal"_) {
@@ -263,13 +276,27 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
                          // rightKey), instead use schema information to determine which side each
                          // key belongs to.
                          if (args.size() == 2) {
-                           leftKeysArgs.push_back(args[0].clone(CloneReason::EXPRESSION_WRAPPING));
-                           rightKeysArgs.push_back(args[1].clone(CloneReason::EXPRESSION_WRAPPING));
+                           keyPairs.emplace_back(args[0].clone(CloneReason::EXPRESSION_WRAPPING),
+                                                 args[1].clone(CloneReason::EXPRESSION_WRAPPING));
                          }
                        } else {
                          // It is a residual filter (or a boolean literal, etc.): assign to tables
                          walkView(dynamics[i], metadata);
                        }
+                     }
+
+                     std::sort(keyPairs.begin(), keyPairs.end(), [](const auto &a, const auto &b) {
+                       auto aFirst = serializeExpr(a.first);
+                       auto bFirst = serializeExpr(b.first);
+                       if (aFirst != bFirst)
+                         return aFirst < bFirst;
+                       return serializeExpr(a.second) < serializeExpr(b.second);
+                     });
+
+                     boss::ExpressionArguments leftKeysArgs, rightKeysArgs;
+                     for (auto &[leftKey, rightKey] : keyPairs) {
+                       leftKeysArgs.push_back(std::move(leftKey));
+                       rightKeysArgs.push_back(std::move(rightKey));
                      }
 
                      // TODO: before we just had the keys as dynamics[1] and dynamics[3],
@@ -477,6 +504,18 @@ void expandSignature(ViewMetadata &metadata, std::unordered_map<boss::Symbol, Vi
 
     for (auto &edge : viewMeta.signature.joinEdges)
       metadata.signature.joinEdges.push_back(edge);
+  }
+
+  // Canonicalise inner join edges so that the left sources are always lexicographically smaller
+  // than the right Important for matching semantically equivalent joins that are written in
+  // different orders
+  for (auto &edge : metadata.signature.joinEdges) {
+    if (edge.joinType != JoinType::INNER)
+      continue;
+    if (canonicalSourceKey(edge.leftSources) > canonicalSourceKey(edge.rightSources)) {
+      std::swap(edge.leftSources, edge.rightSources);
+      std::swap(edge.leftKeys, edge.rightKeys);
+    }
   }
 }
 

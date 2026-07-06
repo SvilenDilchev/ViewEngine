@@ -780,3 +780,89 @@
           (ve-eval (ClearTables))
           (ve-eval (RegisterTable cp5_tbl "/data/cp5.tbl" "/lib/loader.so" #f cp5_a cp5_b cp5_c))
           (ve-eval (Project cp5_tbl cp5_a)))))
+
+
+(test-group "Join canonicalisation - rewriter"
+
+  (ve-eval (ClearViews))
+  (ve-eval (ClearTables))
+
+  ;; --- Side-swap canonicalisation for INNER joins ---
+
+  (test "Inner join with swapped sides still matches view"
+        '(Join customers orders (Equal customer_id order_customer_id))
+        (begin
+          (ve-eval (RegisterTable customers "/data/customers.tbl" "/lib/loader.so" #f customer_id customer_name))
+          (ve-eval (RegisterTable orders "/data/orders.tbl" "/lib/loader.so" #f order_id order_customer_id))
+          (ve-eval (DefineView CUSTOMER_ORDERS_VIEW
+              (Join customers orders (Equal customer_id order_customer_id))))
+          ;; query issued with sides physically reversed
+          (ve-eval (Join orders customers (Equal order_customer_id customer_id)))))
+
+  ;; --- Predicate-pair order independence within a fixed side ---
+
+  (test "Multi-predicate inner join matches regardless of predicate order"
+        '(Join shipments containers (Equal shipment_port container_port) (Equal shipment_date container_date))
+        (begin
+          (ve-eval (RegisterTable shipments "/data/shipments.tbl" "/lib/loader.so" #f shipment_port shipment_date))
+          (ve-eval (RegisterTable containers "/data/containers.tbl" "/lib/loader.so" #f container_port container_date))
+          (ve-eval (DefineView SHIPMENT_CONTAINER_VIEW
+              (Join shipments containers (Equal shipment_port container_port) (Equal shipment_date container_date))))
+          ;; query lists the two equi-predicates in the opposite order
+          (ve-eval (Join shipments containers (Equal shipment_date container_date) (Equal shipment_port container_port)))))
+
+  ;; --- Combined: both swapped sides AND swapped predicate order at once ---
+
+  (test "Inner join matches with both sides and predicate order swapped"
+        '(Join employees departments (Equal employee_dept_x dept_x) (Equal employee_dept_y dept_y))
+        (begin
+          (ve-eval (RegisterTable employees "/data/employees.tbl" "/lib/loader.so" #f employee_dept_x employee_dept_y))
+          (ve-eval (RegisterTable departments "/data/departments.tbl" "/lib/loader.so" #f dept_x dept_y))
+          (ve-eval (DefineView EMPLOYEE_DEPT_VIEW
+              (Join employees departments (Equal employee_dept_x dept_x) (Equal employee_dept_y dept_y))))
+          (ve-eval (Join departments employees (Equal dept_y employee_dept_y) (Equal dept_x employee_dept_x)))))
+
+  ;; --- Regression: LEFT/ANTI joins must NOT be side-swapped ---
+
+  (test "LeftJoin with swapped sides does not match (semantics differ)"
+        '(LeftJoin returns products (Equal return_product_id product_id))
+        (begin
+          (ve-eval (RegisterTable products "/data/products.tbl" "/lib/loader.so" #f product_id product_name))
+          (ve-eval (RegisterTable returns "/data/returns.tbl" "/lib/loader.so" #f return_id return_product_id))
+          (ve-eval (DefineView PRODUCT_RETURNS_VIEW (LeftJoin products returns (Equal product_id return_product_id))))
+          ;; sides reversed relative to the view - must remain unrewritten (passes through as-is)
+          (ve-eval (LeftJoin returns products (Equal return_product_id product_id)))))
+
+  ;; --- Sanity: unmatched inner join (different tables) must not spuriously match ---
+
+  (test "Inner join over unrelated tables does not match unrelated view"
+        '(Join suppliers warehouses (Equal supplier_id warehouse_supplier_id))
+        (begin
+          (ve-eval (RegisterTable suppliers "/data/suppliers.tbl" "/lib/loader.so" #f supplier_id))
+          (ve-eval (RegisterTable warehouses "/data/warehouses.tbl" "/lib/loader.so" #f warehouse_supplier_id))
+          (ve-eval (Join suppliers warehouses (Equal supplier_id warehouse_supplier_id)))))
+
+  ;; --- View-on-view dependency chain, exercises recursive expandSignature/cache path ---
+
+  (test "Inner join matches through a nested view dependency, sides and predicates reversed"
+        '(Join (Join customers orders (Equal customer_id order_customer_id))
+               payments (Equal order_customer_id payment_customer_id))
+        (begin
+          (ve-eval (RegisterTable payments "/data/payments.tbl" "/lib/loader.so" #f payment_id payment_customer_id))
+          (ve-eval (DefineView CUSTOMER_ORDERS_L1
+              (Join customers orders (Equal customer_id order_customer_id))))
+          (ve-eval (DefineView CUSTOMER_ORDERS_PAYMENTS_L2
+              (Join (QueryView CUSTOMER_ORDERS_L1) payments (Equal order_customer_id payment_customer_id))))
+          ;; raw query, no embedded QueryView anywhere — sides reversed relative to the view
+          (ve-eval (Join payments (Join customers orders (Equal customer_id order_customer_id))
+                         (Equal payment_customer_id order_customer_id)))))
+
+  ;; --- Mixed equi-join + residual (non-equi) predicate ---
+
+  (test "Inner join with mixed equi + residual predicate matches regardless of predicate order"
+        '(Join products returns (Equal product_id return_product_id) (Greater product_price 5))
+        (begin
+          (ve-eval (DefineView PRODUCT_RETURNS_FILTERED_VIEW
+              (Join products returns (Equal product_id return_product_id) (Greater product_price 5))))
+          ;; query lists the residual predicate before the equi-predicate
+          (ve-eval (Join products returns (Greater product_price 5) (Equal product_id return_product_id))))))
