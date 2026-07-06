@@ -105,7 +105,6 @@ void ViewMetadata::merge(ViewMetadata &&other) {
       signature.projectedColumns.emplace(col, expr);
     }
   }
-  signature.projectedColumns.merge(other.signature.projectedColumns);
   signature.joinEdges.insert(signature.joinEdges.end(),
                              std::make_move_iterator(other.signature.joinEdges.begin()),
                              std::make_move_iterator(other.signature.joinEdges.end()));
@@ -128,323 +127,308 @@ static bool isSafeUnmatchedJoin(const JoinEdge &viewEdge, const Signature &query
   return true;
 }
 
-// Returns a set of keys of a given map, used for snapshotting sources before walking into a subtree
-static std::unordered_set<const boss::Symbol *> snapshotKeys(const auto &map) {
-  std::unordered_set<const boss::Symbol *> snap;
-  snap.reserve(map.size());
-  for (auto &[k, _] : map)
-    snap.insert(&k);
-  return snap;
-}
-
-// Used to collect new sources added to the metadata signature after walking into a subtree, for
-// join edge construction
-static void collectNewKeys(const auto &map, const std::unordered_set<const boss::Symbol *> &before,
-                           std::unordered_set<boss::Symbol> &out) {
-  for (auto &[k, _] : map)
-    if (!before.count(&k))
-      out.insert(k);
-}
-
 void walkView(const Expression &expr, ViewMetadata &metadata) {
-  std::visit(boss::utilities::overload(
-                 [&](const ComplexExpression &ce) {
-                   if (metadata.sideEffect)
-                     return; // Short circuit if we've already detected a side effect
+  std::visit(
+      boss::utilities::overload(
+          [&](const ComplexExpression &ce) {
+            if (metadata.sideEffect)
+              return; // Short circuit if we've already detected a side effect
 
-                   const auto &head = ce.getHead();
-                   const auto &dynamics = ce.getDynamicArguments();
+            const auto &head = ce.getHead();
+            const auto &dynamics = ce.getDynamicArguments();
 
-                   if (head == "QueryView"_) {
-                     // Treat malformed QueryView as side effect
-                     if (dynamics.empty() || dynamics.size() > 3) {
-                       metadata.sideEffect = true;
-                       return;
-                     }
+            if (head == "QueryView"_) {
+              // Treat malformed QueryView as side effect
+              if (dynamics.empty() || dynamics.size() > 3) {
+                metadata.sideEffect = true;
+                return;
+              }
 
-                     const auto *viewName = std::get_if<Symbol>(&dynamics[0]);
-                     if (!viewName) {
-                       metadata.sideEffect = true;
-                       return;
-                     }
+              const auto *viewName = std::get_if<Symbol>(&dynamics[0]);
+              if (!viewName) {
+                metadata.sideEffect = true;
+                return;
+              }
 
-                     if (dynamics.size() >= 2 && !std::get_if<bool>(&dynamics[1])) {
-                       metadata.sideEffect = true;
-                       return;
-                     }
-                     if (dynamics.size() == 3 && !std::get_if<Symbol>(&dynamics[2])) {
-                       metadata.sideEffect = true;
-                       return;
-                     }
+              if (dynamics.size() >= 2 && !std::get_if<bool>(&dynamics[1])) {
+                metadata.sideEffect = true;
+                return;
+              }
+              if (dynamics.size() == 3 && !std::get_if<Symbol>(&dynamics[2])) {
+                metadata.sideEffect = true;
+                return;
+              }
 
-                     metadata.dependencies.insert(*viewName);
-                     return;
-                   }
+              metadata.dependencies.insert(*viewName);
+              return;
+            }
 
-                   // Detect side prohibited effects
-                   if (sideEffectOperators.count(head)) {
-                     metadata.sideEffect = true;
-                     return;
-                   }
+            // Detect side prohibited effects
+            if (sideEffectOperators.count(head)) {
+              metadata.sideEffect = true;
+              return;
+            }
 
-                   if (head == "ByName"_) {
-                     if (dynamics.empty()) {
-                       metadata.sideEffect = true;
-                       return;
-                     }
+            if (head == "ByName"_) {
+              if (dynamics.empty()) {
+                metadata.sideEffect = true;
+                return;
+              }
 
-                     const auto *tableName = std::get_if<Symbol>(&dynamics[0]);
-                     if (!tableName) {
-                       metadata.sideEffect = true; // Treat malformed ByName as side effect
-                       return;
-                     }
+              const auto *tableName = std::get_if<Symbol>(&dynamics[0]);
+              if (!tableName) {
+                metadata.sideEffect = true; // Treat malformed ByName as side effect
+                return;
+              }
 
-                     metadata.signature.baseTables.insert(*tableName);
-                     return;
-                   }
+              metadata.signature.baseTables.insert(*tableName);
+              return;
+            }
 
-                   if (head == "Filter"_) {
-                     if (dynamics.size() != 2) {
-                       metadata.sideEffect = true; // Treat malformed Filter as side effect
-                       return;
-                     }
+            if (head == "Filter"_) {
+              if (dynamics.size() != 2) {
+                metadata.sideEffect = true; // Treat malformed Filter as side effect
+                return;
+              }
 
-                     walkView(dynamics[0], metadata); // Walk source
-                     walkView(dynamics[1], metadata); // Walk predicate
-                     return;
-                   }
+              walkView(dynamics[0], metadata); // Walk source
+              walkView(dynamics[1], metadata); // Walk predicate
+              return;
+            }
 
-                   if (head == "Project"_) {
-                     if (dynamics.empty()) {
-                       metadata.sideEffect = true; // Treat malformed Project as side effect
-                       return;
-                     }
+            if (head == "Project"_) {
+              if (dynamics.empty()) {
+                metadata.sideEffect = true; // Treat malformed Project as side effect
+                return;
+              }
 
-                     walkView(dynamics[0], metadata);
-                     metadata.signature.projectedColumns.clear();
-                     for (size_t i = 1; i < dynamics.size(); ++i) {
-                       if (const auto *s = std::get_if<Symbol>(&dynamics[i])) {
-                         metadata.signature.projectedColumns.emplace(*s, nullptr);
-                       } else if (const auto *ce = std::get_if<ComplexExpression>(&dynamics[i])) {
-                         if (ce->getHead() != "As"_) // Handle As(expr, alias) projections
-                           return;
-                         if (ce->getDynamicArguments().size() != 2) {
-                           metadata.sideEffect = true;
-                           return;
-                         }
-                         const auto *alias = std::get_if<Symbol>(&ce->getDynamicArguments()[1]);
-                         if (!alias) {
-                           metadata.sideEffect = true;
-                           return;
-                         }
-                         auto shared = std::make_shared<Expression>(
-                             ce->getDynamicArguments()[0].clone(CloneReason::EXPRESSION_WRAPPING));
-                         metadata.signature.projectedColumns.emplace(*alias, std::move(shared));
-                         walkView(ce->getDynamicArguments()[0], metadata);
-                       }
-                     }
-                     return;
-                   }
+              walkView(dynamics[0], metadata);
+              metadata.signature.projectedColumns.clear();
+              for (size_t i = 1; i < dynamics.size(); ++i) {
+                if (const auto *s = std::get_if<Symbol>(&dynamics[i])) {
+                  metadata.signature.projectedColumns.emplace(*s, nullptr);
+                } else if (const auto *ce = std::get_if<ComplexExpression>(&dynamics[i])) {
+                  if (ce->getHead() != "As"_ ||
+                      ce->getDynamicArguments().size() != 2) { // Handle As(expr, alias) projections
+                    metadata.sideEffect = true;
+                    return;
+                  }
+                  const auto *alias = std::get_if<Symbol>(&ce->getDynamicArguments()[1]);
+                  if (!alias) {
+                    metadata.sideEffect = true;
+                    return;
+                  }
+                  auto shared = std::make_shared<Expression>(
+                      ce->getDynamicArguments()[0].clone(CloneReason::EXPRESSION_WRAPPING));
+                  metadata.signature.projectedColumns.emplace(*alias, std::move(shared));
+                  walkView(ce->getDynamicArguments()[0], metadata);
+                }
+              }
+              return;
+            }
 
-                   if (auto it = joinTypeMap.find(head); it != joinTypeMap.end()) {
-                     if (dynamics.size() < 2) {
-                       metadata.sideEffect = true;
-                       return;
-                     }
+            if (auto it = joinTypeMap.find(head); it != joinTypeMap.end()) {
+              if (dynamics.size() < 2) {
+                metadata.sideEffect = true;
+                return;
+              }
 
-                     JoinType parsedJoinType = it->second;
+              JoinType parsedJoinType = it->second;
 
-                     ViewMetadata leftMeta, rightMeta;
-                     walkView(dynamics[0], leftMeta);
-                     walkView(dynamics[1], rightMeta);
+              ViewMetadata leftMeta, rightMeta;
+              walkView(dynamics[0], leftMeta);
+              walkView(dynamics[1], rightMeta);
 
-                     std::unordered_set<boss::Symbol> allLefts = leftMeta.signature.baseTables;
-                     allLefts.insert(leftMeta.dependencies.begin(), leftMeta.dependencies.end());
+              std::unordered_set<boss::Symbol> allLefts = leftMeta.signature.baseTables;
+              allLefts.insert(leftMeta.dependencies.begin(), leftMeta.dependencies.end());
 
-                     std::unordered_set<boss::Symbol> allRights = rightMeta.signature.baseTables;
-                     allRights.insert(rightMeta.dependencies.begin(), rightMeta.dependencies.end());
+              std::unordered_set<boss::Symbol> allRights = rightMeta.signature.baseTables;
+              allRights.insert(rightMeta.dependencies.begin(), rightMeta.dependencies.end());
 
-                     metadata.merge(std::move(leftMeta));
-                     metadata.merge(std::move(rightMeta));
+              metadata.merge(std::move(leftMeta));
+              metadata.merge(std::move(rightMeta));
 
-                     std::vector<std::pair<Expression, Expression>> keyPairs;
-                     for (size_t i = 2; i < dynamics.size(); ++i) {
-                       const auto *pred = std::get_if<ComplexExpression>(&dynamics[i]);
-                       if (pred && pred->getHead() == "Equal"_) {
-                         const auto &args = pred->getDynamicArguments();
-                         if (args.size() == 2) {
-                           keyPairs.emplace_back(args[0].clone(CloneReason::EXPRESSION_WRAPPING),
-                                                 args[1].clone(CloneReason::EXPRESSION_WRAPPING));
-                         }
-                       } else {
-                         // It is a residual filter (or a boolean literal, etc.): assign to tables
-                         walkView(dynamics[i], metadata);
-                       }
-                     }
+              std::vector<std::pair<Expression, Expression>> keyPairs;
+              for (size_t i = 2; i < dynamics.size(); ++i) {
+                const auto *pred = std::get_if<ComplexExpression>(&dynamics[i]);
+                if (pred && pred->getHead() == "Equal"_) {
+                  const auto &args = pred->getDynamicArguments();
+                  if (args.size() == 2) {
+                    keyPairs.emplace_back(args[0].clone(CloneReason::EXPRESSION_WRAPPING),
+                                          args[1].clone(CloneReason::EXPRESSION_WRAPPING));
+                  }
+                } else {
+                  // It is a residual filter (or a boolean literal, etc.): assign to tables
+                  walkView(dynamics[i], metadata);
+                }
+              }
 
-                     std::sort(keyPairs.begin(), keyPairs.end(), [](const auto &a, const auto &b) {
-                       auto aFirst = serializeExpr(a.first);
-                       auto bFirst = serializeExpr(b.first);
-                       if (aFirst != bFirst)
-                         return aFirst < bFirst;
-                       return serializeExpr(a.second) < serializeExpr(b.second);
-                     });
+              std::sort(keyPairs.begin(), keyPairs.end(), [](const auto &a, const auto &b) {
+                auto aFirst = serializeExpr(a.first);
+                auto bFirst = serializeExpr(b.first);
+                if (aFirst != bFirst)
+                  return aFirst < bFirst;
+                return serializeExpr(a.second) < serializeExpr(b.second);
+              });
 
-                     boss::ExpressionArguments leftKeysArgs, rightKeysArgs;
-                     for (auto &[leftKey, rightKey] : keyPairs) {
-                       leftKeysArgs.push_back(std::move(leftKey));
-                       rightKeysArgs.push_back(std::move(rightKey));
-                     }
+              boss::ExpressionArguments leftKeysArgs, rightKeysArgs;
+              for (auto &[leftKey, rightKey] : keyPairs) {
+                leftKeysArgs.push_back(std::move(leftKey));
+                rightKeysArgs.push_back(std::move(rightKey));
+              }
 
-                     // TODO: leftKeys/rightKeys are wrapped in a synthetic "Keys(...)"
-                     // ComplexExpression as a patch to avoid rewriting the serialiser and scorer to
-                     // handle raw key lists directly. Should perhaps store join keys as a vector of
-                     // expressions instead of this wrapper.
-                     Expression leftKeys = ComplexExpression("Keys"_, {}, std::move(leftKeysArgs));
-                     Expression rightKeys =
-                         ComplexExpression("Keys"_, {}, std::move(rightKeysArgs));
+              // TODO: leftKeys/rightKeys are wrapped in a synthetic "Keys(...)"
+              // ComplexExpression as a patch to avoid rewriting the serialiser and scorer to
+              // handle raw key lists directly. Should perhaps store join keys as a vector of
+              // expressions instead of this wrapper.
+              Expression leftKeys = ComplexExpression("Keys"_, {}, std::move(leftKeysArgs));
+              Expression rightKeys = ComplexExpression("Keys"_, {}, std::move(rightKeysArgs));
 
-                     metadata.signature.joinEdges.push_back(
-                         {std::move(allLefts), std::move(allRights),
-                          std::make_shared<Expression>(std::move(leftKeys)),
-                          std::make_shared<Expression>(std::move(rightKeys)), parsedJoinType});
-                     return;
-                   }
+              metadata.signature.joinEdges.push_back(
+                  {std::move(allLefts), std::move(allRights),
+                   std::make_shared<Expression>(std::move(leftKeys)),
+                   std::make_shared<Expression>(std::move(rightKeys)), parsedJoinType});
+              return;
+            }
 
-                   // Predicate conjunction operators just recurse down into the predicates
-                   if (head == "And"_) {
-                     if (dynamics.size() < 2) {
-                       metadata.sideEffect = true; // Malformed And is treated as side effect
-                       return;
-                     }
+            // Predicate conjunction operators just recurse down into the predicates
+            if (head == "And"_) {
+              if (dynamics.size() < 2) {
+                metadata.sideEffect = true; // Malformed And is treated as side effect
+                return;
+              }
 
-                     for (const auto &arg : dynamics)
-                       walkView(arg, metadata);
-                     return;
-                   }
+              for (const auto &arg : dynamics)
+                walkView(arg, metadata);
+              return;
+            }
 
-                   if (flipComparisonOperators.count(head)) {
-                     if (dynamics.size() != 2) {
-                       metadata.sideEffect = true;
-                       return;
-                     }
+            if (flipComparisonOperators.count(head)) {
+              if (dynamics.size() != 2) {
+                metadata.sideEffect = true;
+                return;
+              }
 
-                     bool arg0IsSym = std::holds_alternative<Symbol>(dynamics[0]);
-                     bool arg1IsSym = std::holds_alternative<Symbol>(dynamics[1]);
+              bool arg0IsSym = std::holds_alternative<Symbol>(dynamics[0]);
+              bool arg1IsSym = std::holds_alternative<Symbol>(dynamics[1]);
 
-                     if (!arg0IsSym && !arg1IsSym) {
-                       metadata.sideEffect = true;
-                       return;
-                     }
+              if (!arg0IsSym && !arg1IsSym) {
+                metadata.sideEffect = true;
+                return;
+              }
 
-                     // Both symbols — intra-table column comparison, no flip needed
-                     if (arg0IsSym && arg1IsSym) {
-                       auto colSym0 = std::get<Symbol>(dynamics[0]);
-                       auto colSym1 = std::get<Symbol>(dynamics[1]);
+              // Both symbols — intra-table column comparison, no flip needed
+              if (arg0IsSym && arg1IsSym) {
+                auto colSym0 = std::get<Symbol>(dynamics[0]);
+                auto colSym1 = std::get<Symbol>(dynamics[1]);
 
-                       // Do not actually mark columns not being in the registry as a side effect;
-                       // leave this part of expression correctness up to the user, what is
-                       // actually important is query rewriter correctness which this does not
-                       // affect. Also this is a symptom of a larger problem, relating to which
-                       // sources are present in a given subtree for validation, but fixing that
-                       // requires a significant refactor of what happens at define time and more
-                       // importantly - redefine time, while being functionally irrelevant if the
-                       // expression is not actually malformed.
+                // Do not actually mark columns not being in the registry as a side effect;
+                // leave this part of expression correctness up to the user, what is
+                // actually important is query rewriter correctness which this does not
+                // affect. Also this is a symptom of a larger problem, relating to which
+                // sources are present in a given subtree for validation, but fixing that
+                // requires a significant refactor of what happens at define time and more
+                // importantly - redefine time, while being functionally irrelevant if the
+                // expression is not actually malformed.
 
-                       //  if (columnRegistry.find(colSym0) == columnRegistry.end() ||
-                       //      columnRegistry.find(colSym1) == columnRegistry.end()) {
-                       //    metadata.sideEffect = true;
-                       //    return;
-                       //  }
+                //  if (columnRegistry.find(colSym0) == columnRegistry.end() ||
+                //      columnRegistry.find(colSym1) == columnRegistry.end()) {
+                //    metadata.sideEffect = true;
+                //    return;
+                //  }
 
-                       auto shared =
-                           std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
-                       auto key = serializeExpr(*shared);
+                auto shared =
+                    std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
+                auto key = serializeExpr(*shared);
 
-                       metadata.signature.columnPredicates[colSym0].emplace(key, shared);
-                       metadata.signature.columnPredicates[colSym1].emplace(std::move(key),
-                                                                            std::move(shared));
-                       return;
-                     }
+                metadata.signature.columnPredicates[colSym0].emplace(key, shared);
+                metadata.signature.columnPredicates[colSym1].emplace(std::move(key),
+                                                                     std::move(shared));
+                return;
+              }
 
-                     // One symbol, one literal — canonicalise so column is always on the left
-                     bool needsFlip = arg1IsSym && !arg0IsSym;
+              // One symbol, one literal — canonicalise so column is always on the left
+              bool needsFlip = arg1IsSym && !arg0IsSym;
 
-                     auto colSym = std::get<Symbol>(needsFlip ? dynamics[1] : dynamics[0]);
+              auto colSym = std::get<Symbol>(needsFlip ? dynamics[1] : dynamics[0]);
 
-                     // Again skip check, see comment about malformation checks above
-                     //  if (columnRegistry.find(colSym) == columnRegistry.end()) {
-                     //    metadata.sideEffect = true;
-                     //    return;
-                     //  }
+              // Again skip check, see comment about malformation checks above
+              //  if (columnRegistry.find(colSym) == columnRegistry.end()) {
+              //    metadata.sideEffect = true;
+              //    return;
+              //  }
 
-                     if (needsFlip) {
-                       boss::Symbol canonicalHead = flipComparisonOperators.at(head);
-                       boss::ExpressionArguments canonArgs;
-                       canonArgs.push_back(dynamics[1].clone(CloneReason::EXPRESSION_WRAPPING));
-                       canonArgs.push_back(dynamics[0].clone(CloneReason::EXPRESSION_WRAPPING));
-                       ComplexExpression canonicalExpr(canonicalHead, {}, std::move(canonArgs), {});
-                       auto shared = std::make_shared<Expression>(std::move(canonicalExpr));
-                       auto key = serializeExpr(*shared);
-                       metadata.signature.columnPredicates[colSym].emplace(std::move(key),
-                                                                           std::move(shared));
-                     } else {
-                       auto shared =
-                           std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
-                       auto key = serializeExpr(*shared);
-                       metadata.signature.columnPredicates[colSym].emplace(std::move(key),
-                                                                           std::move(shared));
-                     }
-                     return;
-                   }
+              if (needsFlip) {
+                boss::Symbol canonicalHead = flipComparisonOperators.at(head);
+                boss::ExpressionArguments canonArgs;
+                canonArgs.push_back(dynamics[1].clone(CloneReason::EXPRESSION_WRAPPING));
+                canonArgs.push_back(dynamics[0].clone(CloneReason::EXPRESSION_WRAPPING));
+                ComplexExpression canonicalExpr(canonicalHead, {}, std::move(canonArgs), {});
+                auto shared = std::make_shared<Expression>(std::move(canonicalExpr));
+                auto key = serializeExpr(*shared);
+                metadata.signature.columnPredicates[colSym].emplace(std::move(key),
+                                                                    std::move(shared));
+              } else {
+                auto shared =
+                    std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
+                auto key = serializeExpr(*shared);
+                metadata.signature.columnPredicates[colSym].emplace(std::move(key),
+                                                                    std::move(shared));
+              }
+              return;
+            }
 
-                   // Strict First-Argument Operators
-                   if (strictComparisonOperators.count(head)) {
-                     if (dynamics.empty() || !std::holds_alternative<Symbol>(dynamics[0])) {
-                       metadata.sideEffect = true;
-                       return;
-                     }
+            // Strict First-Argument Operators
+            if (strictComparisonOperators.count(head)) {
+              if (dynamics.empty() || !std::holds_alternative<Symbol>(dynamics[0])) {
+                metadata.sideEffect = true;
+                return;
+              }
 
-                     auto colSym = std::get<Symbol>(dynamics[0]);
+              auto colSym = std::get<Symbol>(dynamics[0]);
 
-                     // Again skip check, see comment re: the same check in flipComparisonOperators
-                     //  if (columnRegistry.find(colSym) == columnRegistry.end()) {
-                     //    metadata.sideEffect = true;
-                     //    return;
-                     //  }
+              // Again skip check, see comment re: the same check in flipComparisonOperators
+              //  if (columnRegistry.find(colSym) == columnRegistry.end()) {
+              //    metadata.sideEffect = true;
+              //    return;
+              //  }
 
-                     auto shared =
-                         std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
-                     auto key = serializeExpr(*shared);
+              auto shared =
+                  std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
+              auto key = serializeExpr(*shared);
 
-                     metadata.signature.columnPredicates[colSym].emplace(std::move(key),
-                                                                         std::move(shared));
-                     return;
-                   }
+              metadata.signature.columnPredicates[colSym].emplace(std::move(key),
+                                                                  std::move(shared));
+              return;
+            }
 
-                   // TODO: handle aggregations
-                   // For now it's with the passthroughs like ordering operators
-                   if (head == "GroupBy"_ || head == "OrderBy"_ || head == "Slice"_) {
-                     if (dynamics.empty()) {
-                       // Treat malformed passthrough operators as side effect
-                       metadata.sideEffect = true;
-                     }
-                     for (size_t i = 0; i < dynamics.size(); ++i) {
-                       walkView(dynamics[i], metadata);
-                     }
-                     return;
-                   }
+            // TODO: handle aggregations
+            // For now it's with the passthroughs like ordering operators
+            if (head == "GroupBy"_ || head == "OrderBy"_ || head == "Slice"_) {
+              if (dynamics.empty()) {
+                // Treat malformed passthrough operators as side effect
+                metadata.sideEffect = true;
+              }
+              for (size_t i = 0; i < dynamics.size(); ++i) {
+                walkView(dynamics[i], metadata);
+              }
+              return;
+            }
 
-                   for (const auto &arg : dynamics) {
-                     walkView(arg, metadata);
-                   }
-                 },
-                 [&](const Symbol &s) {
-                   if (tableRegistry.count(s))
-                     metadata.signature.baseTables.insert(s);
-                 },
-                 [](const auto &) {}),
-             expr);
+            for (const auto &arg : dynamics) {
+              walkView(arg, metadata);
+            }
+          },
+          [&](const Symbol &s) {
+            if (viewRegistry.count(s)) {
+              metadata.dependencies.insert(s);
+              return;
+            }
+            if (tableRegistry.count(s))
+              metadata.signature.baseTables.insert(s);
+          },
+          [](const auto &) {}),
+      expr);
 }
 
 // Expands view sources down to their base tables for accurate comparisons
@@ -648,9 +632,7 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
         return -1.0; // View doesn't project a column the query needs
     }
 
-    projectionCoverage = viewColumns.size() > 0 ? (double)queryParts.projectedColumns.size() /
-                                                      (double)viewColumns.size()
-                                                : -1.0;
+    projectionCoverage = (double)queryParts.projectedColumns.size() / (double)viewColumns.size();
   }
 
   return W_TABLE * tableCoverage + W_PRED * predicateCoverage + W_JOIN * joinCoverage +
