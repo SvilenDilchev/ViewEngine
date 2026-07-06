@@ -272,9 +272,6 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
                        const auto *pred = std::get_if<ComplexExpression>(&dynamics[i]);
                        if (pred && pred->getHead() == "Equal"_) {
                          const auto &args = pred->getDynamicArguments();
-                         // TODO: this assumes equi-join predicates are always Equal(leftKey,
-                         // rightKey), instead use schema information to determine which side each
-                         // key belongs to.
                          if (args.size() == 2) {
                            keyPairs.emplace_back(args[0].clone(CloneReason::EXPRESSION_WRAPPING),
                                                  args[1].clone(CloneReason::EXPRESSION_WRAPPING));
@@ -299,9 +296,10 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
                        rightKeysArgs.push_back(std::move(rightKey));
                      }
 
-                     // TODO: before we just had the keys as dynamics[1] and dynamics[3],
-                     // this is a patch to not rewrite the serialiser and scorer
-                     // but we should properly parse the join keys using schema information
+                     // TODO: leftKeys/rightKeys are wrapped in a synthetic "Keys(...)"
+                     // ComplexExpression as a patch to avoid rewriting the serialiser and scorer to
+                     // handle raw key lists directly. Should perhaps store join keys as a vector of
+                     // expressions instead of this wrapper.
                      Expression leftKeys = ComplexExpression("Keys"_, {}, std::move(leftKeysArgs));
                      Expression rightKeys =
                          ComplexExpression("Keys"_, {}, std::move(rightKeysArgs));
@@ -578,9 +576,9 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
     bool matched = false;
     for (size_t i = 0; i < queryParts.joinEdges.size(); ++i) {
       const auto &queryEdge = queryParts.joinEdges[i];
-      // TODO: join matching is purely syntactic — semantically equivalent joins
-      // (e.g. different key ordering or aliased column names) are not detected.
-      // Needs semantic join key comparison.
+      // TODO: join matching still doesn't detect joins that are semantically equivalent via
+      // column aliasing (e.g. Equal(A.customer_id, ...) vs Equal(A.cust_id, ...) referring to
+      // the same underlying column under a different name). Needs schema-aware alias resolution.
       if (viewEdge.joinType == queryEdge.joinType &&
           viewEdge.leftSources == queryEdge.leftSources &&
           viewEdge.rightSources == queryEdge.rightSources &&
