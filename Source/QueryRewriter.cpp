@@ -1,6 +1,7 @@
 #include "QueryRewriter.hpp"
 #include "MetadataRegistry.hpp"
 #include "ViewRegistry.hpp"
+#include <Expression.hpp>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -639,15 +640,90 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
          W_PROJ * projectionCoverage;
 }
 
-std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata &queryMetadata,
-                                          std::unordered_map<boss::Symbol, ViewMetadata> &cache,
-                                          std::unordered_set<boss::Symbol> &seen) {
+std::optional<Expression> computeResidualFilter(const Signature &viewParts,
+                                                const Signature &queryParts) {
+  std::unordered_map<std::string, std::shared_ptr<Expression>> missing;
+
+  for (const auto &[col, queryPreds] : queryParts.columnPredicates) {
+    auto vIt = viewParts.columnPredicates.find(col);
+    bool colCovered = (vIt != viewParts.columnPredicates.end());
+
+    for (const auto &[key, expr] : queryPreds) {
+      if (!colCovered || !vIt->second.count(key))
+        missing.emplace(key, expr);
+    }
+  }
+
+  if (missing.empty())
+    return std::nullopt;
+
+  boss::ExpressionArguments residualArgs;
+  for (const auto &[key, expr] : missing)
+    residualArgs.push_back(expr->clone(CloneReason::EXPRESSION_WRAPPING));
+
+  if (residualArgs.size() == 1)
+    return std::move(residualArgs[0]);
+
+  return ComplexExpression("And"_, {}, std::move(residualArgs), {});
+}
+
+std::optional<boss::ExpressionArguments> computeResidualProjection(const Signature &viewParts,
+                                                                   const Signature &queryParts) {
+  if (viewParts.projectedColumns.empty() && queryParts.projectedColumns.empty())
+    return std::nullopt;
+
+  if (!viewParts.projectedColumns.empty() && !queryParts.projectedColumns.empty()) {
+    if (viewParts.projectedColumns.size() == queryParts.projectedColumns.size())
+      return std::nullopt;
+
+    boss::ExpressionArguments residualArgs;
+    for (const auto &[col, _] : queryParts.projectedColumns)
+      residualArgs.push_back(Symbol(col));
+
+    return std::move(residualArgs);
+  }
+
+  if (!viewParts.projectedColumns.empty() && queryParts.projectedColumns.empty()) {
+    std::unordered_set<boss::Symbol> queryColumns;
+    for (const auto &table : queryParts.baseTables) {
+      const auto &entry = tableRegistry.find(table);
+      if (entry == tableRegistry.end())
+        return std::nullopt; // Shouldn't happen, but still bail safely
+      for (const auto &col : entry->second.columns)
+        queryColumns.insert(col);
+    }
+
+    if (queryColumns.size() == viewParts.projectedColumns.size())
+      return std::nullopt; // View projects exactly the base columns, no residual projection needed
+
+    boss::ExpressionArguments residualArgs;
+    // TODO: Looping a set loses the ordering of columns that should probably exist
+    for (const auto &col : queryColumns)
+      residualArgs.push_back(Symbol(col));
+
+    return std::move(residualArgs);
+  }
+
+  // if (viewParts.projectedColumns.empty() && !queryParts.projectedColumns.empty())
+  boss::ExpressionArguments cols;
+  for (const auto &[col, expr] : queryParts.projectedColumns)
+    cols.push_back(Symbol(col));
+  return std::move(cols);
+}
+
+std::optional<Expression> findRewriting(const Expression &query, ViewMetadata &queryMetadata,
+                                        std::unordered_map<boss::Symbol, ViewMetadata> &cache,
+                                        std::unordered_set<boss::Symbol> &seen) {
   auto *ce = std::get_if<ComplexExpression>(&query);
   if (!ce || !rewritableOperators.count(ce->getHead()))
     return std::nullopt;
 
   if (queryMetadata.sideEffect)
     return std::nullopt;
+
+  std::optional<ViewMetadata> bestMatch;
+  std::optional<boss::Symbol> bestName;
+  double bestScore = -1.0;
 
   // TODO: look into building a complete reverse index of base table -> top level views that
   // reference it at define time to nuke the search space instead of scanning all views
@@ -659,9 +735,46 @@ std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata 
     expandSignature(viewMeta, cache, seen);
 
     double score = scoreView(viewMeta.signature, queryMetadata.signature);
-    // TODO: consider non-perfect matches and extract remainder to apply on top of the view
-    if (score >= 1.0)
-      return name;
+    if (score >= 1.0) {
+      boss::ExpressionArguments args;
+      args.push_back(Symbol(name));
+      Expression queryView = ComplexExpression("QueryView"_, {}, std::move(args), {});
+      return queryView;
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestName = name;
+      bestMatch = std::move(viewMeta);
+    }
   }
+
+  // TODO: if the view already contains a filter or a project, then the residuals are currently
+  // added on top where they could be merged into the existing ones
+  if (bestMatch && bestName) {
+    boss::ExpressionArguments args;
+    args.push_back(Symbol(*bestName));
+    Expression rewritten = ComplexExpression("QueryView"_, {}, std::move(args), {});
+
+    if (auto residualFilter =
+            computeResidualFilter(bestMatch->signature, queryMetadata.signature)) {
+      boss::ExpressionArguments filterArgs;
+      filterArgs.push_back(std::move(rewritten));
+      filterArgs.push_back(std::move(*residualFilter));
+      rewritten = ComplexExpression("Filter"_, {}, std::move(filterArgs), {});
+    }
+
+    if (auto residualArgs =
+            computeResidualProjection(bestMatch->signature, queryMetadata.signature)) {
+      boss::ExpressionArguments projectArgs;
+      projectArgs.push_back(std::move(rewritten));
+      for (auto &a : *residualArgs)
+        projectArgs.push_back(std::move(a));
+      rewritten = ComplexExpression("Project"_, {}, std::move(projectArgs), {});
+    }
+
+    return rewritten;
+  }
+
   return std::nullopt;
 }

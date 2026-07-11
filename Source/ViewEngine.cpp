@@ -30,10 +30,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
       // Clear referenced columns if the view definition needs more than what the query needs
       // TODO: re-extract from view definition for proper pruning
       queryMetadata->referencedColumns.clear();
-      boss::ExpressionArguments args;
-      args.emplace_back(Symbol(*match));
-      auto rewritten = Expression(ComplexExpression("QueryView"_, {}, std::move(args), {}));
-      return evaluate(std::move(rewritten), queryMetadata);
+      return evaluate(std::move(*match), queryMetadata, true);
     }
   }
 
@@ -443,7 +440,8 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               boss::ExpressionArguments queryViewArgs;
               queryViewArgs.emplace_back(std::move(s));
               // TODO: implement adaptive caching
-              auto rewritten = Expression(ComplexExpression("QueryView"_, {}, std::move(queryViewArgs), {}));
+              auto rewritten =
+                  Expression(ComplexExpression("QueryView"_, {}, std::move(queryViewArgs), {}));
               return evaluate(std::move(rewritten), queryMetadata);
             }
 

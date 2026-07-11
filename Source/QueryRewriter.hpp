@@ -78,7 +78,8 @@ void expandSignature(ViewMetadata &metadata, std::unordered_map<boss::Symbol, Vi
 double scoreView(const Signature &viewParts, const Signature &queryParts);
 
 // Return the best scoring view for the given query, or nullopt if no rewriting is possible
-// Currently only returns a perfect match (score of 1.0)
-std::optional<boss::Symbol> findRewriting(const Expression &query, ViewMetadata &queryMetadata,
-                                          std::unordered_map<boss::Symbol, ViewMetadata> &cache,
-                                          std::unordered_set<boss::Symbol> &seen);
+// If the view does not match perfectly, it wraps it in a residual Filter and/or Project operator
+// Doesn't handle any residual join logic for now
+std::optional<boss::Expression> findRewriting(const Expression &query, ViewMetadata &queryMetadata,
+                                              std::unordered_map<boss::Symbol, ViewMetadata> &cache,
+                                              std::unordered_set<boss::Symbol> &seen);

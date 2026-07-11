@@ -866,3 +866,76 @@
               (Join products returns (Equal product_id return_product_id) (Greater product_price 5))))
           ;; query lists the residual predicate before the equi-predicate
           (ve-eval (Join products returns (Greater product_price 5) (Equal product_id return_product_id))))))
+
+
+(test-group "Partial rewriting - residual Filter/Project"
+
+  (ve-eval (ClearViews))
+  (ve-eval (ClearTables))
+
+  (ve-eval (RegisterTable pr_products "/data/pr_products.tbl" "/lib/loader.so" #f
+             pr_product_id pr_product_name pr_product_price))
+  (ve-eval (RegisterTable pr_returns "/data/pr_returns.tbl" "/lib/loader.so" #f
+             pr_return_id pr_return_product_id))
+
+  (test "Predicate-only residual: extra Filter applied on top of resolved view"
+        '(Filter (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+                 (Greater pr_product_price 5))
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView PR_JOIN_VIEW
+              (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))))
+          (ve-eval (Filter
+              (Join pr_returns pr_products (Equal pr_return_product_id pr_product_id))
+              (Greater pr_product_price 5)))))
+
+  (test "Projection-only residual: view over-projects, query narrows via residual Project"
+        '(Project
+          (Project (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+                    pr_product_id pr_product_name pr_product_price pr_return_id)
+          pr_product_id)
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView PR_WIDE_VIEW
+              (Project (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+                        pr_product_id pr_product_name pr_product_price pr_return_id)))
+          (ve-eval (Project
+              (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+              pr_product_id))))
+
+  (test "Combined residual: Filter innermost, Project outermost, wrapping resolved view"
+        '(Project
+          (Filter (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+                  (Greater pr_product_price 5))
+          pr_product_id)
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView PR_PLAIN_VIEW
+              (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))))
+          (ve-eval (Project
+              (Filter
+                (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+                (Greater pr_product_price 5))
+              pr_product_id))))
+
+  (test "Not rewritable: view missing a projected column leaves query unchanged"
+        '(Project (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+                   pr_product_id pr_product_price)
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView PR_NARROW_VIEW
+              (Project (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+                        pr_product_id pr_return_id)))
+          (ve-eval (Project
+              (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+              pr_product_id pr_product_price))))
+              
+  (test "Not rewritable: view predicate absent from query is not silently applied"
+        '(Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView PR_FILTERED_VIEW
+              (Filter
+                (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+                (Greater pr_product_price 5))))
+          (ve-eval (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))))))
