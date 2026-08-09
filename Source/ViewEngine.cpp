@@ -2,8 +2,6 @@
 #include "MetadataRegistry.hpp"
 #include "ViewRegistry.hpp"
 
-#include <iostream>
-
 using boss::expressions::CloneReason;
 
 static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr,
@@ -202,9 +200,6 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 if (it == viewRegistry.end())
                   throw std::runtime_error("View not found for caching in WithCaches: " +
                                            name.getName());
-
-                std::cerr << "[cache] " << name.getName() << " computeCost=" << entry.computeCost
-                          << " materialiseCost=" << entry.materialiseCost << "\n";
 
                 if (!it->second.cached)
                   it->second.cached = evaluate(std::move(entry.value), queryMetadata, true);
