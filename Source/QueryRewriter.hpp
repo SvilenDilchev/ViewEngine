@@ -22,6 +22,26 @@ constexpr double W_JOIN = 0.30;
 constexpr double W_PRED = 0.20;
 constexpr double W_PROJ = 0.10;
 
+// Used in scoring to determine if we need a residual filter for a specific domain
+enum class DomainCoverage { NONE, COVERS, EQUAL };
+
+// Variant type for values used in predicates, used for canonicalising expressions
+using DomainValue = std::variant<bool, int64_t, double, std::string>;
+
+// nullopt on either lower or upper means unbounded
+struct Interval {
+  std::optional<DomainValue> lower;
+  std::optional<DomainValue> upper;
+  bool lowerInclusive = true;
+  bool upperInclusive = true;
+};
+
+struct ColumnDomain {
+  std::vector<Interval> ranges; // sorted by lower bound, non-overlapping
+  bool unrepresentable = false; // if there is a type clash while merging predicates, tell the
+                                // rewriter to reject for this column
+};
+
 enum class JoinType { INNER, LEFT, ANTI };
 
 // Data structure to represent join relationships between sources in a query, used for rewriting
@@ -36,8 +56,16 @@ struct JoinEdge {
 struct Signature {
   // Set of base tables the expression references
   std::unordered_set<boss::Symbol> baseTables;
+  // Domains are ranges of values of that column that satisfy a given predicate
+  // Predicates like Greater, Less, LessEqual are stored here
+  std::unordered_map<boss::Symbol, ColumnDomain> columnDomains;
+  // If the destructive side of a left / anti join has predicates then we cannot "correctly"
+  // represent these predicates in the signature, so we reject all attempts to rewrite an incoming
+  // query using this view, also block any rewriting if the query itself has such a predicate
+  bool hasUnsafeJoinPredicate = false;
   // Map of column name to the predicates that apply to it,
   // which are stored as a serialised string key to the actual expression
+  // Predicates like Match_Substring, Like, IsValid are stored here
   std::unordered_map<boss::Symbol, std::unordered_map<std::string, std::shared_ptr<Expression>>>
       columnPredicates;
   // Map of projected column names to the expressions that define them across the entire query
@@ -45,7 +73,7 @@ struct Signature {
   // Join relationships between sources in the query
   std::vector<JoinEdge> joinEdges;
 
-  // Goes through columnPredicates, projectedColumns, and joinEdges to extract the columns needed to
+  // Goes through columnPredicates, columnDomains, projectedColumns, and joinEdges to extract the columns needed to
   // evaluate the expression; used for column pruning for the Gather operator
   void extractAllReferencedColumns(std::unordered_set<boss::Symbol> &out) const;
 };
@@ -56,14 +84,14 @@ struct Signature {
 // populated with extractAllReferencedColumns instead of during the walk
 // - sideEffect: true if the definition contains prohibited operations
 // - signature: tables, predicates, projections, and joins found in the expression
-// - merge: helper function to combine metadata from subtrees
+// - intersectMerge: helper function to combine metadata from subtrees
 struct ViewMetadata {
   std::unordered_set<boss::Symbol> dependencies;
   std::unordered_set<boss::Symbol> referencedColumns;
   bool sideEffect = false;
   Signature signature;
 
-  void merge(ViewMetadata &&other);
+  void intersectMerge(ViewMetadata &&other);
 };
 
 // Recursively walks a view definition expression, populating ViewMetadata;

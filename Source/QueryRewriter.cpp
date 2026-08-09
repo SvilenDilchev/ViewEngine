@@ -14,15 +14,13 @@ static const std::unordered_set<boss::Symbol> sideEffectOperators = {"DefineView
 static const std::unordered_set<boss::Symbol> rewritableOperators = {
     "Filter"_, "Join"_, "LeftJoin"_, "AntiJoin"_, "Project"_};
 
-// Used to canonicalise predicates for comparisons and scoring
-// Greater(a, 5) and Less(5, a) are equivalent
-static const std::unordered_set<boss::Symbol> strictComparisonOperators = {
-    "Between"_, "Like"_, "Match_Substring"_, "IsValid"_};
+// Set of operators that will be compared by serialising the expression and comparing the strings.
+static const std::unordered_set<boss::Symbol> opaquePredicateOperators = {
+    "Like"_, "Match_Substring"_, "IsValid"_};
 
-static const std::unordered_map<boss::Symbol, boss::Symbol> flipComparisonOperators = {
-    {"Equal"_, "Equal"_},  {"NotEqual"_, "NotEqual"_},
-    {"Greater"_, "Less"_}, {"GreaterEqual"_, "LessEqual"_},
-    {"Less"_, "Greater"_}, {"LessEqual"_, "GreaterEqual"_}};
+// Set of operators that will be compared semantically
+static const std::unordered_set<boss::Symbol> domainPredicateOperators = {
+    "Equal"_, "NotEqual"_, "Greater"_, "GreaterEqual"_, "Less"_, "LessEqual"_, "Between"_};
 
 // Map for parsing BOSS symbols into JoinType enum values
 static const std::unordered_map<boss::Symbol, JoinType> joinTypeMap = {
@@ -62,6 +60,7 @@ canonicalSourceKey(const std::unordered_set<boss::Symbol> &sources) {
 
 // Helper function to extract column symbols
 // Used to walk As operator expressions saved in projectedColumns
+// and to get the columns referenced in Or expressions that are stored as opaque predicates
 static void extractColumnsFromExpr(const Expression &expr, std::unordered_set<boss::Symbol> &out) {
   std::visit(boss::utilities::overload(
                  [&](const Symbol &s) {
@@ -80,20 +79,106 @@ void Signature::extractAllReferencedColumns(std::unordered_set<boss::Symbol> &ou
   // Column predicate keys are directly column symbols
   for (const auto &[col, _] : columnPredicates)
     out.insert(col);
+  for (const auto &[col, _] : columnDomains)
+    out.insert(col);
   for (const auto &[col, expr] : projectedColumns) {
     if (expr)
       extractColumnsFromExpr(*expr, out);
     else
       out.insert(col);
   }
+  for (const auto &edge : joinEdges) {
+    if (edge.leftKeys)
+      extractColumnsFromExpr(*edge.leftKeys, out);
+    if (edge.rightKeys)
+      extractColumnsFromExpr(*edge.rightKeys, out);
+  }
 }
 
-void ViewMetadata::merge(ViewMetadata &&other) {
+// Pairwise intersection of two ColumnDomains
+static ColumnDomain intersectDomains(const ColumnDomain &a, const ColumnDomain &b) {
+  ColumnDomain result;
+  result.unrepresentable = a.unrepresentable || b.unrepresentable;
+
+  for (const auto &rangeA : a.ranges) {
+    for (const auto &rangeB : b.ranges) {
+      Interval out;
+
+      // lower bound
+      if (!rangeA.lower) {
+        out.lower = rangeB.lower;
+        out.lowerInclusive = rangeB.lowerInclusive;
+      } else if (!rangeB.lower) {
+        out.lower = rangeA.lower;
+        out.lowerInclusive = rangeA.lowerInclusive;
+      } else if (rangeA.lower->index() != rangeB.lower->index()) {
+        result.unrepresentable = true;
+        continue;
+      } else if (*rangeA.lower > *rangeB.lower) {
+        out.lower = rangeA.lower;
+        out.lowerInclusive = rangeA.lowerInclusive;
+      } else if (*rangeB.lower > *rangeA.lower) {
+        out.lower = rangeB.lower;
+        out.lowerInclusive = rangeB.lowerInclusive;
+      } else {
+        out.lower = rangeA.lower;
+        out.lowerInclusive = rangeA.lowerInclusive && rangeB.lowerInclusive;
+      }
+
+      // upper bound
+      if (!rangeA.upper) {
+        out.upper = rangeB.upper;
+        out.upperInclusive = rangeB.upperInclusive;
+      } else if (!rangeB.upper) {
+        out.upper = rangeA.upper;
+        out.upperInclusive = rangeA.upperInclusive;
+      } else if (rangeA.upper->index() != rangeB.upper->index()) {
+        result.unrepresentable = true;
+        continue;
+      } else if (*rangeA.upper < *rangeB.upper) {
+        out.upper = rangeA.upper;
+        out.upperInclusive = rangeA.upperInclusive;
+      } else if (*rangeB.upper < *rangeA.upper) {
+        out.upper = rangeB.upper;
+        out.upperInclusive = rangeB.upperInclusive;
+      } else {
+        out.upper = rangeA.upper;
+        out.upperInclusive = rangeA.upperInclusive && rangeB.upperInclusive;
+      }
+
+      // drop if empty
+      if (out.lower && out.upper) {
+        if (*out.lower > *out.upper)
+          continue;
+        if (*out.lower == *out.upper && !(out.lowerInclusive && out.upperInclusive))
+          continue;
+      }
+
+      result.ranges.push_back(out);
+    }
+  }
+
+  return result;
+}
+
+// Merge that results in the intersection of the predicates in the two signatures
+// Used for And operator handling in Filters and for Join operator handling
+void ViewMetadata::intersectMerge(ViewMetadata &&other) {
   dependencies.merge(other.dependencies);
   sideEffect = sideEffect || other.sideEffect;
   signature.baseTables.merge(other.signature.baseTables);
+
+  for (auto &[col, domain] : other.signature.columnDomains) {
+    auto it = signature.columnDomains.find(col);
+    if (it == signature.columnDomains.end())
+      signature.columnDomains.emplace(col, std::move(domain));
+    else
+      it->second = intersectDomains(it->second, domain);
+  }
+
   for (auto &[col, preds] : other.signature.columnPredicates)
     signature.columnPredicates[col].merge(preds);
+
   for (auto &[col, expr] : other.signature.projectedColumns) {
     auto it = signature.projectedColumns.find(col);
     if (it != signature.projectedColumns.end()) {
@@ -106,6 +191,7 @@ void ViewMetadata::merge(ViewMetadata &&other) {
       signature.projectedColumns.emplace(col, expr);
     }
   }
+
   signature.joinEdges.insert(signature.joinEdges.end(),
                              std::make_move_iterator(other.signature.joinEdges.begin()),
                              std::make_move_iterator(other.signature.joinEdges.end()));
@@ -126,6 +212,142 @@ static bool isSafeUnmatchedJoin(const JoinEdge &viewEdge, const Signature &query
         return false; // If query has a join involving the view source on the right
   }
   return true;
+}
+
+// Extract the literal out of an Expression for intervalisation
+static std::optional<DomainValue> extractDomainValue(const Expression &expr) {
+  return std::visit(
+      boss::utilities::overload(
+          [](bool b) -> std::optional<DomainValue> { return DomainValue{b}; },
+          [](int64_t i) -> std::optional<DomainValue> { return DomainValue{i}; },
+          [](int32_t i) -> std::optional<DomainValue> { return DomainValue{int64_t{i}}; },
+          [](double d) -> std::optional<DomainValue> { return DomainValue{d}; },
+          [](float f) -> std::optional<DomainValue> { return DomainValue{double{f}}; },
+          [](const std::string &s) -> std::optional<DomainValue> { return DomainValue{s}; },
+          [](const auto &) -> std::optional<DomainValue> { return std::nullopt; }),
+      expr);
+}
+
+// Reverse of extractDomainValue, used to build comparison expressions from intervals
+static Expression domainValueToExpression(const DomainValue &value) {
+  return std::visit([](const auto &v) -> Expression { return v; }, value);
+}
+
+// Updates the domain ranges by intersercting with a new interval
+static void intersectDomain(std::unordered_map<Symbol, ColumnDomain> &domains, const Symbol &col,
+                            const Interval &newInterval) {
+  auto it = domains.find(col);
+  if (it == domains.end()) {
+    // First predicate ever seen on this column just becomes the domain.
+    domains.emplace(col, ColumnDomain{{newInterval}, false});
+    return;
+  }
+
+  it->second = intersectDomains(it->second, ColumnDomain{{newInterval}, false});
+};
+
+// Updates domain ranges by subtracting a specific point
+static void subtractPoint(std::unordered_map<Symbol, ColumnDomain> &domains, const Symbol &col,
+                          const DomainValue &point) {
+  auto it = domains.find(col);
+  if (it == domains.end()) {
+    domains.emplace(col, ColumnDomain{{Interval{std::nullopt, point, true, false},
+                                       Interval{point, std::nullopt, false, true}},
+                                      false});
+    return;
+  }
+
+  ColumnDomain &existing = it->second;
+  std::vector<Interval> result;
+
+  for (const auto &range : existing.ranges) {
+    // Type checks
+    if (range.lower && range.lower->index() != point.index()) {
+      existing.unrepresentable = true;
+      continue;
+    }
+    if (range.upper && range.upper->index() != point.index()) {
+      existing.unrepresentable = true;
+      continue;
+    }
+
+    bool pointBelowRange =
+        range.lower && (*range.lower > point || (*range.lower == point && !range.lowerInclusive));
+    bool pointAboveRange =
+        range.upper && (*range.upper < point || (*range.upper == point && !range.upperInclusive));
+    if (pointBelowRange || pointAboveRange) {
+      result.push_back(range); // point doesn't touch this range at all
+      continue;
+    }
+
+    bool pointAtLowerEdge = range.lower && range.lowerInclusive && *range.lower == point;
+    bool pointAtUpperEdge = range.upper && range.upperInclusive && *range.upper == point;
+    if (pointAtLowerEdge && pointAtUpperEdge) {
+      continue; // range was exactly {v}, remove it
+    }
+    if (pointAtLowerEdge) {
+      result.push_back(Interval{point, range.upper, false, range.upperInclusive});
+      continue;
+    }
+    if (pointAtUpperEdge) {
+      result.push_back(Interval{range.lower, point, range.lowerInclusive, false});
+      continue;
+    }
+
+    // Point inside the range, split into two ranges
+    result.push_back(Interval{range.lower, point, range.lowerInclusive, false});
+    result.push_back(Interval{point, range.upper, false, range.upperInclusive});
+  }
+
+  existing.ranges = std::move(result);
+}
+
+// Builds an interval from a comparison operator and a literal value, taking into account which
+// argument is the column symbol
+static Interval buildComparisonInterval(const Symbol &head, const DomainValue &literal,
+                                        bool colIsArg0) {
+  Interval interval;
+
+  if (head == "Equal"_) {
+    interval.lower = literal;
+    interval.upper = literal;
+    interval.lowerInclusive = true;
+    interval.upperInclusive = true;
+  } else if (head == "Greater"_) {
+    if (colIsArg0) {
+      interval.lower = literal;
+      interval.lowerInclusive = false;
+    } else {
+      interval.upper = literal;
+      interval.upperInclusive = false;
+    }
+  } else if (head == "GreaterEqual"_) {
+    if (colIsArg0) {
+      interval.lower = literal;
+      interval.lowerInclusive = true;
+    } else {
+      interval.upper = literal;
+      interval.upperInclusive = true;
+    }
+  } else if (head == "Less"_) {
+    if (colIsArg0) {
+      interval.upper = literal;
+      interval.upperInclusive = false;
+    } else {
+      interval.lower = literal;
+      interval.lowerInclusive = false;
+    }
+  } else if (head == "LessEqual"_) {
+    if (colIsArg0) {
+      interval.upper = literal;
+      interval.upperInclusive = true;
+    } else {
+      interval.lower = literal;
+      interval.lowerInclusive = true;
+    }
+  }
+
+  return interval;
 }
 
 void walkView(const Expression &expr, ViewMetadata &metadata) {
@@ -246,8 +468,17 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
               std::unordered_set<boss::Symbol> allRights = rightMeta.signature.baseTables;
               allRights.insert(rightMeta.dependencies.begin(), rightMeta.dependencies.end());
 
-              metadata.merge(std::move(leftMeta));
-              metadata.merge(std::move(rightMeta));
+              metadata.intersectMerge(std::move(leftMeta));
+              // Remove the predicates for the destructive side of an unsafe join and flag the
+              // signature as unsafe
+              if (parsedJoinType == JoinType::LEFT || parsedJoinType == JoinType::ANTI)
+                if (!rightMeta.signature.columnDomains.empty() ||
+                    !rightMeta.signature.columnPredicates.empty()) {
+                  metadata.signature.hasUnsafeJoinPredicate = true;
+                  rightMeta.signature.columnDomains.clear();
+                  rightMeta.signature.columnPredicates.clear();
+                }
+              metadata.intersectMerge(std::move(rightMeta));
 
               std::vector<std::pair<Expression, Expression>> keyPairs;
               for (size_t i = 2; i < dynamics.size(); ++i) {
@@ -292,7 +523,6 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
               return;
             }
 
-            // Predicate conjunction operators just recurse down into the predicates
             if (head == "And"_) {
               if (dynamics.size() < 2) {
                 metadata.sideEffect = true; // Malformed And is treated as side effect
@@ -304,7 +534,194 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
               return;
             }
 
-            if (flipComparisonOperators.count(head)) {
+            if (head == "Or"_) {
+              if (dynamics.size() < 2) {
+                metadata.sideEffect = true; // malformed Or
+                return;
+              }
+
+              std::vector<ViewMetadata> branches;
+              branches.reserve(dynamics.size());
+
+              for (const auto &arg : dynamics) {
+                ViewMetadata branchMeta;
+                walkView(arg, branchMeta);
+                branches.push_back(std::move(branchMeta));
+              }
+
+              bool unionisable = true;
+              std::optional<boss::Symbol> sharedColumn;
+              for (auto &branch : branches) {
+                // Merge bookkeeping that's independent of the domain / opaque predicates
+                metadata.sideEffect = metadata.sideEffect || branch.sideEffect ||
+                                      !branch.signature.joinEdges.empty() ||
+                                      !branch.signature.projectedColumns.empty();
+                metadata.dependencies.merge(branch.dependencies);
+                metadata.signature.baseTables.merge(branch.signature.baseTables);
+
+                // Check if the or can be unionised for must be handled as an opaque predicate
+                if (!branch.signature.columnPredicates.empty() ||
+                    branch.signature.columnDomains.size() != 1)
+                  unionisable = false;
+                else if (branch.signature.columnDomains.size() == 1) {
+                  if (!sharedColumn)
+                    sharedColumn = branch.signature.columnDomains.begin()->first;
+                  else if (*sharedColumn != branch.signature.columnDomains.begin()->first)
+                    unionisable = false;
+                }
+              }
+
+              if (metadata.sideEffect)
+                return;
+
+              if (unionisable) {
+                bool unrepresentable = false;
+                std::vector<Interval> allRanges;
+
+                // Collect all ranges from the branches for the shared column
+                for (const auto &branch : branches) {
+                  const ColumnDomain &domain = branch.signature.columnDomains.at(*sharedColumn);
+                  if (domain.unrepresentable) {
+                    unrepresentable = true;
+                    break;
+                  }
+                  allRanges.insert(allRanges.end(), domain.ranges.begin(), domain.ranges.end());
+                }
+
+                if (unrepresentable) {
+                  metadata.signature.columnDomains[*sharedColumn] = ColumnDomain{{}, true};
+                  return;
+                }
+                if (allRanges.empty()) {
+                  metadata.signature.columnDomains[*sharedColumn] = ColumnDomain{{}, false};
+                  return;
+                }
+
+                // Type checks
+                std::optional<size_t> typeIndex;
+                bool typeClash = false;
+
+                for (const auto &r : allRanges) {
+                  for (const auto &bound : {r.lower, r.upper}) {
+                    if (!bound)
+                      continue;
+                    if (!typeIndex)
+                      typeIndex = bound->index();
+                    else if (*typeIndex != bound->index())
+                      typeClash = true;
+                  }
+                }
+
+                if (typeClash) {
+                  metadata.signature.columnDomains[*sharedColumn] = ColumnDomain{{}, true};
+                  return;
+                }
+
+                // Sort all ranges
+                std::sort(allRanges.begin(), allRanges.end(),
+                          [](const Interval &x, const Interval &y) {
+                            if (!x.lower && !y.lower)
+                              return false;
+                            if (!x.lower)
+                              return true; // x unbounded below, sorts first
+                            if (!y.lower)
+                              return false;
+                            if (*x.lower != *y.lower)
+                              return *x.lower < *y.lower;
+                            // same lower value: inclusive bound sorts first (covers more)
+                            return x.lowerInclusive && !y.lowerInclusive;
+                          });
+
+                // Union merge ranges 1 by 1
+                std::vector<Interval> merged;
+                merged.push_back(allRanges[0]);
+
+                for (size_t i = 1; i < allRanges.size(); ++i) {
+                  Interval &last = merged.back();
+                  const Interval &cur = allRanges[i];
+
+                  // Do cur and last overlap or touch (adjacent with at least one side inclusive)
+                  // Last is unbounded above; current is unbounded below;
+                  // Current starts before last ends; or current starts exactly where last ends
+                  // and at least one side is inclusive so we don't have a missing point
+                  bool overlapsOrTouches =
+                      !last.upper || !cur.lower || *cur.lower < *last.upper ||
+                      (*cur.lower == *last.upper && (last.upperInclusive || cur.lowerInclusive));
+
+                  // Union them by just adding curr with the gap between them still there
+                  if (!overlapsOrTouches) {
+                    merged.push_back(cur);
+                    continue;
+                  }
+
+                  // Extend last's upper bound if cur reaches further
+                  if (!cur.upper) {
+                    last.upper = std::nullopt;
+                    last.upperInclusive = true;
+                  } else if (!last.upper) {
+                    // last is already unbounded above, stays unbounded
+                  } else if (*cur.upper > *last.upper) {
+                    last.upper = cur.upper;
+                    last.upperInclusive = cur.upperInclusive;
+                  } else if (*cur.upper == *last.upper) {
+                    last.upperInclusive = last.upperInclusive || cur.upperInclusive;
+                  }
+                  // else cur.upper < last.upper: cur is fully contained in last, nothing to do
+                }
+
+                // Fully unrestricted after union
+                // (domain predicate should be removed from the signature)
+                if (merged.size() == 1 && !merged[0].lower && !merged[0].upper) {
+                  metadata.signature.columnDomains.erase(*sharedColumn);
+                } else {
+                  metadata.signature.columnDomains[*sharedColumn] =
+                      ColumnDomain{std::move(merged), false};
+                }
+              } else {
+                // Fallback to opaque predicate handling for the whole Or expression
+                auto shared =
+                    std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
+                auto key = serializeExpr(*shared);
+
+                std::unordered_set<Symbol> refCols;
+                extractColumnsFromExpr(*shared, refCols);
+                for (const auto &col : refCols)
+                  metadata.signature.columnPredicates[col].emplace(key, shared);
+              }
+
+              return;
+            }
+
+            if (head == "Between"_) {
+              if (dynamics.size() != 3) {
+                metadata.sideEffect = true;
+                return;
+              }
+
+              const auto *colSym = std::get_if<Symbol>(&dynamics[0]);
+              if (!colSym) {
+                metadata.sideEffect = true;
+                return;
+              }
+
+              auto low = extractDomainValue(dynamics[1]);
+              auto high = extractDomainValue(dynamics[2]);
+              if (!low || !high) {
+                metadata.sideEffect = true; // bounds must be literals we can intervalize
+                return;
+              }
+
+              Interval interval;
+              interval.lower = *low;
+              interval.upper = *high;
+              interval.lowerInclusive = true;
+              interval.upperInclusive = true;
+
+              intersectDomain(metadata.signature.columnDomains, *colSym, interval);
+              return;
+            }
+
+            if (domainPredicateOperators.count(head)) {
               if (dynamics.size() != 2) {
                 metadata.sideEffect = true;
                 return;
@@ -318,7 +735,7 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
                 return;
               }
 
-              // Both symbols — intra-table column comparison, no flip needed
+              // Both symbols, no domain possible, just save as opaque predicate for scoring
               if (arg0IsSym && arg1IsSym) {
                 auto colSym0 = std::get<Symbol>(dynamics[0]);
                 auto colSym1 = std::get<Symbol>(dynamics[1]);
@@ -348,39 +765,28 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
                 return;
               }
 
-              // One symbol, one literal — canonicalise so column is always on the left
-              bool needsFlip = arg1IsSym && !arg0IsSym;
-
-              auto colSym = std::get<Symbol>(needsFlip ? dynamics[1] : dynamics[0]);
-
-              // Again skip check, see comment about malformation checks above
-              //  if (columnRegistry.find(colSym) == columnRegistry.end()) {
-              //    metadata.sideEffect = true;
-              //    return;
-              //  }
-
-              if (needsFlip) {
-                boss::Symbol canonicalHead = flipComparisonOperators.at(head);
-                boss::ExpressionArguments canonArgs;
-                canonArgs.push_back(dynamics[1].clone(CloneReason::EXPRESSION_WRAPPING));
-                canonArgs.push_back(dynamics[0].clone(CloneReason::EXPRESSION_WRAPPING));
-                ComplexExpression canonicalExpr(canonicalHead, {}, std::move(canonArgs), {});
-                auto shared = std::make_shared<Expression>(std::move(canonicalExpr));
-                auto key = serializeExpr(*shared);
-                metadata.signature.columnPredicates[colSym].emplace(std::move(key),
-                                                                    std::move(shared));
-              } else {
-                auto shared =
-                    std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
-                auto key = serializeExpr(*shared);
-                metadata.signature.columnPredicates[colSym].emplace(std::move(key),
-                                                                    std::move(shared));
+              bool colIsArg0 = arg0IsSym;
+              auto colSym = std::get<Symbol>(colIsArg0 ? dynamics[0] : dynamics[1]);
+              auto literal = extractDomainValue(colIsArg0 ? dynamics[1] : dynamics[0]);
+              if (!literal) {
+                metadata.sideEffect = true;
+                return;
               }
+
+              if (head == "NotEqual"_) {
+                // Subtract the literal from the ranges in the column domain
+                subtractPoint(metadata.signature.columnDomains, colSym, *literal);
+                return;
+              }
+
+              // Build an interval and intersect
+              Interval interval = buildComparisonInterval(head, *literal, colIsArg0);
+              intersectDomain(metadata.signature.columnDomains, colSym, interval);
               return;
             }
 
-            // Strict First-Argument Operators
-            if (strictComparisonOperators.count(head)) {
+            // Non-domain predicates stored as serialised expressions for scoring
+            if (opaquePredicateOperators.count(head)) {
               if (dynamics.empty() || !std::holds_alternative<Symbol>(dynamics[0])) {
                 metadata.sideEffect = true;
                 return;
@@ -388,7 +794,7 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
 
               auto colSym = std::get<Symbol>(dynamics[0]);
 
-              // Again skip check, see comment re: the same check in flipComparisonOperators
+              // Again skip check, see comment re: the same check in domainPredicateOperators
               //  if (columnRegistry.find(colSym) == columnRegistry.end()) {
               //    metadata.sideEffect = true;
               //    return;
@@ -460,6 +866,19 @@ void expandSignature(ViewMetadata &metadata, std::unordered_map<boss::Symbol, Vi
     for (auto &[col, preds] : viewMeta.signature.columnPredicates)
       metadata.signature.columnPredicates[col].merge(preds);
 
+    // Merge column domains with intersect semantics
+    for (auto &[col, domain] : viewMeta.signature.columnDomains) {
+      auto it = metadata.signature.columnDomains.find(col);
+      if (it == metadata.signature.columnDomains.end())
+        metadata.signature.columnDomains.emplace(col, domain);
+      else
+        it->second = intersectDomains(it->second, domain);
+    }
+
+    // Merge unsafe join predicate flag
+    metadata.signature.hasUnsafeJoinPredicate =
+        metadata.signature.hasUnsafeJoinPredicate || viewMeta.signature.hasUnsafeJoinPredicate;
+
     // Merge base tables
     metadata.signature.baseTables.insert(viewMeta.signature.baseTables.begin(),
                                          viewMeta.signature.baseTables.end());
@@ -502,7 +921,61 @@ void expandSignature(ViewMetadata &metadata, std::unordered_map<boss::Symbol, Vi
   }
 }
 
+// Returns the coverage of the query domain by the view domain
+static DomainCoverage domainCoverage(const ColumnDomain &viewDomain,
+                                     const ColumnDomain &queryDomain) {
+  if (viewDomain.unrepresentable || queryDomain.unrepresentable)
+    return DomainCoverage::NONE;
+
+  if (queryDomain.ranges.empty())
+    return DomainCoverage::NONE;
+
+  bool allExact = true;
+
+  for (const auto &qRange : queryDomain.ranges) {
+    bool contained = false;
+    bool exact = false;
+
+    for (const auto &vRange : viewDomain.ranges) {
+      bool lowerOk =
+          !vRange.lower ||
+          (qRange.lower &&
+           (*qRange.lower > *vRange.lower ||
+            (*qRange.lower == *vRange.lower && (!qRange.lowerInclusive || vRange.lowerInclusive))));
+      bool upperOk =
+          !vRange.upper ||
+          (qRange.upper &&
+           (*qRange.upper < *vRange.upper ||
+            (*qRange.upper == *vRange.upper && (!qRange.upperInclusive || vRange.upperInclusive))));
+
+      if (lowerOk && upperOk) {
+        contained = true;
+        bool lowerSame = (!vRange.lower && !qRange.lower) ||
+                         (vRange.lower && qRange.lower && *vRange.lower == *qRange.lower &&
+                          vRange.lowerInclusive == qRange.lowerInclusive);
+        bool upperSame = (!vRange.upper && !qRange.upper) ||
+                         (vRange.upper && qRange.upper && *vRange.upper == *qRange.upper &&
+                          vRange.upperInclusive == qRange.upperInclusive);
+        if (lowerSame && upperSame)
+          exact = true;
+        break;
+      }
+    }
+
+    if (!contained)
+      return DomainCoverage::NONE;
+    if (!exact)
+      allExact = false;
+  }
+
+  return allExact ? DomainCoverage::EQUAL : DomainCoverage::COVERS;
+}
+
 double scoreView(const Signature &viewParts, const Signature &queryParts) {
+  // Condition 0: flags that directly block the rewriting process
+  if (viewParts.hasUnsafeJoinPredicate || queryParts.hasUnsafeJoinPredicate)
+    return -1.0;
+
   // Condition 1: view must share at least one table with the query
   size_t commonTables = 0;
   for (const auto &table : viewParts.baseTables)
@@ -518,27 +991,21 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
   size_t totalQueryPreds = 0;
   size_t coveredQueryPreds = 0;
 
+  // 2a: opaque predicates (Like/Match_Substring/IsValid/col-vs-col), compared syntactically
   for (const auto &[col, viewPreds] : viewParts.columnPredicates) {
     auto qIt = queryParts.columnPredicates.find(col);
-    // View applies predicates on a column the query doesn't;
-    // any filtering here silently restricts the result the query sees.
-    // TODO: Semantic reasoning needed with knowledge of the actual data
-    // if a predicate does not affect the data at all (e.g. Greater(l_price, -1) when l_price is
-    // always positive) then this is not a coverage failure
+    // View applies an opaque predicate (Like/Match_Substring/IsValid/col-vs-col) on a column
+    // the query doesn't; these have no domain representation, so we can't reason about them yet
+    // and any mismatch is a hard rejection
     if (qIt == queryParts.columnPredicates.end())
       return -1.0;
 
     const auto &queryPreds = qIt->second;
     for (const auto &[key, _] : viewPreds)
-      // TODO: this is a syntactic check only — semantically weaker predicates in the view
-      // (e.g. Greater(l_price, 50) when query has Greater(l_price, 100)) are incorrectly
-      // rejected. Needs semantic predicate strength comparison.
+      // Syntactic check of opaque predicates, can't reason for partial coverage
       if (!queryPreds.count(key))
         return -1.0;
 
-    // TODO: when semantic predicate comparison is implemented, we should give partial credit
-    // for weaker view predicates that still cover some of the query predicates, update our return
-    // tell us exactly how much more should be added on top of the query
     totalQueryPreds += queryPreds.size();
     for (const auto &[key, _] : queryPreds)
       if (viewPreds.count(key))
@@ -548,6 +1015,30 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
   for (const auto &[col, queryPreds] : queryParts.columnPredicates)
     if (!viewParts.columnPredicates.count(col))
       totalQueryPreds += queryPreds.size();
+
+  // 2b: domain predicates (Equal/NotEqual/Greater/GreaterEqual/Less/LessEqual/Between), compared
+  // semantically and scored for partial coverage
+  for (const auto &[col, viewDomain] : viewParts.columnDomains) {
+    auto qIt = queryParts.columnDomains.find(col);
+    if (qIt == queryParts.columnDomains.end())
+      return -1.0; // View has a domain predicate on a column the query doesn't
+
+    const auto &queryDomain = qIt->second;
+    // TODO: accurate partial credit for domain coverage (e.g. view has a weaker range than the
+    // query, but not fully covering it), currently we just give 0.5 credit for any non-exact
+    // coverage, and 1.0 for exact coverage
+    DomainCoverage coverage = domainCoverage(viewDomain, queryDomain);
+    if (coverage == DomainCoverage::NONE)
+      return -1.0; // View's domain predicate is stronger than the query's, can't use it
+
+    coveredQueryPreds += (coverage == DomainCoverage::EQUAL) ? 1.0 : 0.5;
+  }
+
+  totalQueryPreds += queryParts.columnDomains.size();
+  for (const auto &[col, queryDomain] : queryParts.columnDomains)
+    if (!viewParts.columnDomains.count(col))
+      coveredQueryPreds += 0.5; // View doesn't have a domain predicate on a column the query does,
+                                // usable but not exactly matching, so give partial credit
 
   double predicateCoverage =
       (totalQueryPreds > 0) ? (double)coveredQueryPreds / (double)totalQueryPreds : 1.0;
@@ -589,7 +1080,8 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
       auto it = viewParts.projectedColumns.find(col);
       if (it == viewParts.projectedColumns.end()) {
         // TODO: check if any view projection has the same underlying expression but a different
-        // name — if so, a rename Project on top of the view could satisfy the query (partial match)
+        // name — if so, a rename Project on top of the view could satisfy the query (partial
+        // match)
         return -1.0;
       }
       if (it->second && queryExpr && serializeExpr(*it->second) != serializeExpr(*queryExpr))
@@ -640,6 +1132,77 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
          W_PROJ * projectionCoverage;
 }
 
+static Expression intervalToExpression(const Symbol &col, const Interval &range) {
+  bool hasLower = range.lower.has_value();
+  bool hasUpper = range.upper.has_value();
+
+  if (hasLower && !hasUpper) {
+    boss::ExpressionArguments args;
+    args.push_back(Symbol(col));
+    args.push_back(domainValueToExpression(*range.lower));
+    return ComplexExpression(range.lowerInclusive ? "GreaterEqual"_ : "Greater"_, {},
+                             std::move(args), {});
+  }
+
+  if (!hasLower && hasUpper) {
+    boss::ExpressionArguments args;
+    args.push_back(Symbol(col));
+    args.push_back(domainValueToExpression(*range.upper));
+    return ComplexExpression(range.upperInclusive ? "LessEqual"_ : "Less"_, {}, std::move(args),
+                             {});
+  }
+
+  // From here on we know both lower and upper bounds exist
+  if (*range.lower == *range.upper) {
+    boss::ExpressionArguments args;
+    args.push_back(Symbol(col));
+    args.push_back(domainValueToExpression(*range.lower));
+    return ComplexExpression("Equal"_, {}, std::move(args), {});
+  }
+
+  // Utilise between operator if both bounds are inclusive, otherwise fall back to And(Greater/Less)
+  if (range.lowerInclusive && range.upperInclusive) {
+    boss::ExpressionArguments args;
+    args.push_back(Symbol(col));
+    args.push_back(domainValueToExpression(*range.lower));
+    args.push_back(domainValueToExpression(*range.upper));
+    return ComplexExpression("Between"_, {}, std::move(args), {});
+  }
+
+  boss::ExpressionArguments lowerArgs, upperArgs, andArgs;
+  lowerArgs.push_back(Symbol(col));
+  lowerArgs.push_back(domainValueToExpression(*range.lower));
+  andArgs.push_back(ComplexExpression(range.lowerInclusive ? "GreaterEqual"_ : "Greater"_, {},
+                                      std::move(lowerArgs), {}));
+
+  upperArgs.push_back(Symbol(col));
+  upperArgs.push_back(domainValueToExpression(*range.upper));
+  andArgs.push_back(ComplexExpression(range.upperInclusive ? "LessEqual"_ : "Less"_, {},
+                                      std::move(upperArgs), {}));
+
+  return ComplexExpression("And"_, {}, std::move(andArgs), {});
+}
+
+// Convert a ColumnDomain into an Expression that represents the same predicate
+// Used to build the residual filter
+static std::optional<Expression> domainToExpression(const Symbol &col, const ColumnDomain &domain) {
+  boss::ExpressionArguments pieces;
+  for (const auto &range : domain.ranges) {
+    if (!range.lower && !range.upper)
+      continue; // fully unbounded range - no constraint to express, skip it
+
+    pieces.push_back(intervalToExpression(col, range));
+  }
+
+  if (pieces.empty())
+    return std::nullopt; // shouldn't in practice happen
+
+  if (pieces.size() == 1)
+    return std::move(pieces[0]);
+
+  return ComplexExpression("Or"_, {}, std::move(pieces), {});
+}
+
 std::optional<Expression> computeResidualFilter(const Signature &viewParts,
                                                 const Signature &queryParts) {
   std::unordered_map<std::string, std::shared_ptr<Expression>> missing;
@@ -651,6 +1214,19 @@ std::optional<Expression> computeResidualFilter(const Signature &viewParts,
     for (const auto &[key, expr] : queryPreds) {
       if (!colCovered || !vIt->second.count(key))
         missing.emplace(key, expr);
+    }
+  }
+
+  for (const auto &[col, queryDomain] : queryParts.columnDomains) {
+    auto vIt = viewParts.columnDomains.find(col);
+
+    DomainCoverage coverage = (vIt != viewParts.columnDomains.end())
+                                  ? domainCoverage(vIt->second, queryDomain)
+                                  : DomainCoverage::NONE;
+
+    if (coverage != DomainCoverage::EQUAL) {
+      if (auto expr = domainToExpression(col, queryDomain))
+        missing.emplace(serializeExpr(*expr), std::make_shared<Expression>(std::move(*expr)));
     }
   }
 
@@ -694,7 +1270,8 @@ std::optional<boss::ExpressionArguments> computeResidualProjection(const Signatu
     }
 
     if (queryColumns.size() == viewParts.projectedColumns.size())
-      return std::nullopt; // View projects exactly the base columns, no residual projection needed
+      return std::nullopt; // View projects exactly the base columns, no residual projection
+                           // needed
 
     boss::ExpressionArguments residualArgs;
     // TODO: Looping a set loses the ordering of columns that should probably exist

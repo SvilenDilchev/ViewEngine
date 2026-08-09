@@ -939,3 +939,191 @@
                 (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
                 (Greater pr_product_price 5))))
           (ve-eval (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))))))
+
+
+(test-group "Domain predicate semantics"
+
+  (ve-eval (ClearViews))
+  (ve-eval (ClearTables))
+
+  (ve-eval (RegisterTable dp_products "/data/dp_products.tbl" "/lib/loader.so" #f
+             dp_product_id dp_product_name dp_product_price))
+  (ve-eval (RegisterTable dp_returns "/data/dp_returns.tbl" "/lib/loader.so" #f
+             dp_return_id dp_return_product_id))
+
+  ;; --- View domain strictly weaker than query domain: must match with residual ---
+
+  (test "View with Greater(price,50) matches query needing Greater(price,100), residual added"
+        '(Filter (Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                          (Greater dp_product_price 50))
+                 (Greater dp_product_price 100))
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView DP_WEAK_VIEW
+              (Filter
+                (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                (Greater dp_product_price 50))))
+          (ve-eval (Filter
+              (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+              (Greater dp_product_price 100)))))
+
+  ;; --- View domain strictly stronger than query domain: must NOT match ---
+
+  (test "View with Greater(price,100) does not cover query needing Greater(price,50)"
+        '(Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                 (Greater dp_product_price 50))
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView DP_STRONG_VIEW
+              (Filter
+                (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                (Greater dp_product_price 100))))
+          (ve-eval (Filter
+              (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+              (Greater dp_product_price 50)))))
+
+  ;; --- Exact domain match: no residual should be added ---
+
+  (test "View with exact same domain predicate as query needs no residual"
+        '(Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                 (Greater dp_product_price 50))
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView DP_EXACT_VIEW
+              (Filter
+                (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                (Greater dp_product_price 50))))
+          (ve-eval (Filter
+              (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+              (Greater dp_product_price 50)))))
+
+  ;; --- Between covered by an equivalent view built from two comparisons ---
+
+  (test "View with Greater+Less matches query needing a narrower Between"
+        '(Filter (Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                          (And (Greater dp_product_price 10) (Less dp_product_price 50)))
+                 (Between dp_product_price 20 30))
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView DP_RANGE_VIEW
+              (Filter
+                (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                (And (Greater dp_product_price 10) (Less dp_product_price 50)))))
+          (ve-eval (Filter
+              (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+              (Between dp_product_price 20 30)))))
+
+  ;; --- Unrestricted view column vs query domain: usable but residual still needed ---
+
+  (test "View unrestricted on price still needs residual Filter for query's Greater"
+        '(Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                 (Greater dp_product_price 5))
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView DP_PLAIN_VIEW
+              (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))))
+          (ve-eval (Filter
+              (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+              (Greater dp_product_price 5)))))
+
+  ;; --- Single-column Or: real domain union, should match a subset request ---
+
+  (test "View with Or on same column (union) matches a query needing a subset range"
+        '(Filter (Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                          (Or (Less dp_product_price 10) (Greater dp_product_price 5)))
+                 (Greater dp_product_price 5))
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView DP_OR_VIEW
+              (Filter
+                (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                (Or (Less dp_product_price 10) (Greater dp_product_price 5)))))
+          (ve-eval (Filter
+              (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+              (Greater dp_product_price 5)))))
+
+  ;; --- Cross-column Or: opaque fallback, only exact same expression should match ---
+
+  (test "View with cross-column Or matches only exact same Or expression in query"
+        '(Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                 (Or (Greater dp_product_price 5) (Greater dp_return_id 10)))
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView DP_CROSS_OR_VIEW
+              (Filter
+                (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                (Or (Greater dp_product_price 5) (Greater dp_return_id 10)))))
+          (ve-eval (Filter
+              (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+              (Or (Greater dp_product_price 5) (Greater dp_return_id 10))))))
+
+  (test "View with cross-column Or does not match a differently-shaped query predicate"
+        '(Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                 (Greater dp_product_price 5))
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView DP_CROSS_OR_VIEW2
+              (Filter
+                (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                (Or (Greater dp_product_price 5) (Greater dp_return_id 10)))))
+          (ve-eval (Filter
+              (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+              (Greater dp_product_price 5)))))
+
+  ;; --- NotEqual: split-range domain ---
+
+  (test "View with matching NotEqual needs no residual"
+        '(Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                 (NotEqual dp_product_price 5))
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView DP_NOTEQUAL_VIEW
+              (Filter
+                (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                (NotEqual dp_product_price 5))))
+          (ve-eval (Filter
+              (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+              (NotEqual dp_product_price 5)))))
+
+  (test "View with NotEqual(5) covers query needing Greater(10) via subset range, residual added"
+        '(Filter (Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                          (NotEqual dp_product_price 5))
+                 (Greater dp_product_price 10))
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView DP_NOTEQUAL_VIEW2
+              (Filter
+                (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                (NotEqual dp_product_price 5))))
+          (ve-eval (Filter
+              (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+              (Greater dp_product_price 10)))))
+
+  ;; --- LEFT JOIN with a pre-filtered right (destructive) side: rewriting must be blocked ---
+
+  (test "View is a LeftJoin with filtered right side - query against it is not rewritten"
+        '(LeftJoin dp_products
+             (Filter dp_returns (Greater dp_return_id 100))
+             (Equal dp_product_id dp_return_product_id))
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView DP_LEFTJOIN_VIEW
+              (LeftJoin dp_products
+                 (Filter dp_returns (Greater dp_return_id 100))
+                 (Equal dp_product_id dp_return_product_id))))
+          (ve-eval (LeftJoin dp_products
+                       (Filter dp_returns (Greater dp_return_id 100))
+                       (Equal dp_product_id dp_return_product_id)))))
+
+  ;; --- Regression: exact base-table/join match but unrestricted domain column must still residual ---
+
+  (test "Regression: unrestricted view on filtered column always produces residual, never bare QueryView"
+        '(Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+                 (Greater dp_product_price 5))
+        (begin
+          (ve-eval (ClearViews))
+          (ve-eval (DefineView DP_REGRESSION_VIEW
+              (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))))
+          (ve-eval (Filter
+              (Join dp_returns dp_products (Equal dp_return_product_id dp_product_id))
+              (Greater dp_product_price 5))))))
