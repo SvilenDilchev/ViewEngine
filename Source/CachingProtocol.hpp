@@ -56,6 +56,14 @@ struct CacheEntry {
   CacheEntryType type;
   std::optional<IntegrityCheckMode>
       integrityMode; // guideline for engines, not a strict requirement
+
+  // Running cost totals of wall time sprent producing this entry, accumulated by each engine that
+  // touches it during the pipeline pass. Each engine is responsible to accurately separate the time
+  // spent computing the entry vs. the time spent materialising it as an intermediate result if it
+  // chooses to do so. These costs are used for benefit calculations to decide whether to cache the
+  // entry in the view registry or not.
+  double computeCost = 0.0;
+  double materialiseCost = 0.0;
 };
 
 // Registry mapping view names to cache entries. The registry is not about persistance, but
@@ -94,7 +102,8 @@ inline Expression unpackWithCaches(Expression &&expr, CacheRegistry &registry) {
     std::optional<IntegrityCheckMode> mode = std::nullopt;
     if (type == CacheEntryType::Borrowed && wDynamics.size() >= 3) {
       auto const &modeSym = std::get<Symbol>(wDynamics[2]);
-      mode = modeSym == "Structural"_ ? IntegrityCheckMode::Structural : IntegrityCheckMode::Content;
+      mode =
+          modeSym == "Structural"_ ? IntegrityCheckMode::Structural : IntegrityCheckMode::Content;
     }
 
     registry[std::move(name)] = CacheEntry{std::move(wDynamics[1]), type, mode};
