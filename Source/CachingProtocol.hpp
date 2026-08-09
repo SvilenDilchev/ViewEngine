@@ -98,15 +98,18 @@ inline Expression unpackWithCaches(Expression &&expr, CacheRegistry &registry) {
     CacheEntryType type = wHead == "Borrowed"_ ? CacheEntryType::Borrowed : CacheEntryType::Pending;
 
     auto name = std::get<Symbol>(std::move(wDynamics[0]));
+    auto value = std::move(wDynamics[1]);
+    auto computeCost = std::get<double>(wDynamics[2]);
+    auto materialiseCost = std::get<double>(wDynamics[3]);
 
     std::optional<IntegrityCheckMode> mode = std::nullopt;
-    if (type == CacheEntryType::Borrowed && wDynamics.size() >= 3) {
-      auto const &modeSym = std::get<Symbol>(wDynamics[2]);
+    if (type == CacheEntryType::Borrowed && wDynamics.size() >= 5) {
+      auto const &modeSym = std::get<Symbol>(wDynamics[4]);
       mode =
           modeSym == "Structural"_ ? IntegrityCheckMode::Structural : IntegrityCheckMode::Content;
     }
 
-    registry[std::move(name)] = CacheEntry{std::move(wDynamics[1]), type, mode};
+    registry[std::move(name)] = CacheEntry{std::move(value), type, mode, computeCost, materialiseCost};
   }
 
   return std::move(dynamics[numArgs - 1]);
@@ -121,9 +124,11 @@ inline Expression repackWithCaches(CacheRegistry &&registry, Expression &&finalE
   for (auto &&[name, entry] : registry) {
     boss::ExpressionArguments wrapperArgs;
     auto const &mode = entry.integrityMode;
-    wrapperArgs.reserve(mode ? 3u : 2u);
+    wrapperArgs.reserve(mode ? 5u : 4u);
     wrapperArgs.emplace_back(name);
     wrapperArgs.emplace_back(std::move(entry.value));
+    wrapperArgs.emplace_back(entry.computeCost);
+    wrapperArgs.emplace_back(entry.materialiseCost);
     if (mode) {
       wrapperArgs.emplace_back(*mode == IntegrityCheckMode::Structural ? "Structural"_
                                                                        : "Content"_);
