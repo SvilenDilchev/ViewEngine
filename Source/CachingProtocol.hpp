@@ -28,6 +28,15 @@ enum class CacheEntryType {
   Pending,  // View definition to be cached after evaluation of the full pipeline
 };
 
+enum class ExecutionStrategy {
+  Standard,            // Instrumentation already trustworthy - engine may use
+                       // whatever normal/optimized execution it has (fusion,
+                       // pipelining, reuse of cached dependencies, etc.)
+  IsolatedMeasurement, // Profiling data missing - engines should evaluate expression independently
+                       // of any cached dependencies, so we get an accurate measurement of the cost
+                       // of this expression alone.
+};
+
 // Optional optimisation guideline for engines to follow while connecting their own caching logic to
 // this protocol. Designed to help engines identify when it is safe to use their own cached results
 // for the incoming BOSS expression, instead of reevaluating it. However, engines can always
@@ -57,13 +66,16 @@ struct CacheEntry {
   std::optional<IntegrityCheckMode>
       integrityMode; // guideline for engines, not a strict requirement
 
-  // Running cost totals of wall time sprent producing this entry, accumulated by each engine that
-  // touches it during the pipeline pass. Each engine is responsible to accurately separate the time
-  // spent computing the entry vs. the time spent materialising it as an intermediate result if it
-  // chooses to do so. These costs are used for benefit calculations to decide whether to cache the
-  // entry in the view registry or not.
+  // Running cost totals of wall time sprent producing or reusing this entry, accumulated by each
+  // engine that touches it during the pipeline pass. Each engine is responsible to accurately
+  // separate the time spent computing the entry vs. the time spent materialising it as an
+  // intermediate result if it chooses to do so. These costs are used for benefit calculations to
+  // decide whether to cache the entry in the view registry or not.
   double computeCost = 0.0;
   double materialiseCost = 0.0;
+  double reuseCost = 0.0;
+
+  ExecutionStrategy executionStrategy = ExecutionStrategy::Standard;
 };
 
 // Registry mapping view names to cache entries. The registry is not about persistance, but
@@ -101,15 +113,20 @@ inline Expression unpackWithCaches(Expression &&expr, CacheRegistry &registry) {
     auto value = std::move(wDynamics[1]);
     auto computeCost = std::get<double>(wDynamics[2]);
     auto materialiseCost = std::get<double>(wDynamics[3]);
+    auto reuseCost = std::get<double>(wDynamics[4]);
+    auto executionStrategy = std::get<Symbol>(wDynamics[5]) == "IsolatedMeasurement"_
+                                 ? ExecutionStrategy::IsolatedMeasurement
+                                 : ExecutionStrategy::Standard;
 
     std::optional<IntegrityCheckMode> mode = std::nullopt;
-    if (type == CacheEntryType::Borrowed && wDynamics.size() >= 5) {
-      auto const &modeSym = std::get<Symbol>(wDynamics[4]);
+    if (type == CacheEntryType::Borrowed && wDynamics.size() >= 7) {
+      auto const &modeSym = std::get<Symbol>(wDynamics[6]);
       mode =
           modeSym == "Structural"_ ? IntegrityCheckMode::Structural : IntegrityCheckMode::Content;
     }
 
-    registry[std::move(name)] = CacheEntry{std::move(value), type, mode, computeCost, materialiseCost};
+    registry[std::move(name)] = CacheEntry{
+        std::move(value), type, mode, computeCost, materialiseCost, reuseCost, executionStrategy};
   }
 
   return std::move(dynamics[numArgs - 1]);
@@ -124,11 +141,15 @@ inline Expression repackWithCaches(CacheRegistry &&registry, Expression &&finalE
   for (auto &&[name, entry] : registry) {
     boss::ExpressionArguments wrapperArgs;
     auto const &mode = entry.integrityMode;
-    wrapperArgs.reserve(mode ? 5u : 4u);
+    wrapperArgs.reserve(mode ? 7u : 6u);
     wrapperArgs.emplace_back(name);
     wrapperArgs.emplace_back(std::move(entry.value));
     wrapperArgs.emplace_back(entry.computeCost);
     wrapperArgs.emplace_back(entry.materialiseCost);
+    wrapperArgs.emplace_back(entry.reuseCost);
+    wrapperArgs.emplace_back(entry.executionStrategy == ExecutionStrategy::IsolatedMeasurement
+                                 ? "IsolatedMeasurement"_
+                                 : "Standard"_);
     if (mode) {
       wrapperArgs.emplace_back(*mode == IntegrityCheckMode::Structural ? "Structural"_
                                                                        : "Content"_);
