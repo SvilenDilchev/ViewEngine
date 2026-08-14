@@ -15,7 +15,10 @@ struct ViewEntry {
   double materialiseCost = 0.0;
   double reuseCost = 0.0;
 
-  double size = 0.0;
+  double size = 0.0; // Size of the materialised view in bytes
+
+  double importanceFactor = 0.0;       // Used to rank views for eviction from cache
+  uint64_t importanceLastAgedTick = 0; // Last tick (global query count) when importance was aged
 };
 
 extern std::unordered_map<boss::Symbol, ViewEntry> viewRegistry; // In memory register of Views
@@ -28,6 +31,16 @@ extern std::unordered_set<boss::Symbol> evaluationStack;         // Guard agains
 extern std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> tableToViews;
 // View name -> set of view names that directly depend on it (reverse dependency map)
 extern std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> viewToViews;
+
+// Global call count of the view engine. Incremented on each top-level evaluate() call.
+// This means it's incremented twice per processed query at the start and end of a pipeline
+// that has the view engine at both ends.
+extern uint64_t veTick;
+constexpr double IMPORTANCE_DECAY_FACTOR = 0.98;
+
+// Age the importance factor of a view entry based on how many queries
+// have been executed since it was last aged.
+void ageEntry(ViewEntry &entry);
 
 // DFS walk to detect cycles in the dependency graph
 bool hasCycle(const boss::Symbol &newView, const boss::Symbol &current,

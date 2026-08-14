@@ -73,8 +73,8 @@ struct Signature {
   // Join relationships between sources in the query
   std::vector<JoinEdge> joinEdges;
 
-  // Goes through columnPredicates, columnDomains, projectedColumns, and joinEdges to extract the columns needed to
-  // evaluate the expression; used for column pruning for the Gather operator
+  // Goes through columnPredicates, columnDomains, projectedColumns, and joinEdges to extract the
+  // columns needed to evaluate the expression; used for column pruning for the Gather operator
   void extractAllReferencedColumns(std::unordered_set<boss::Symbol> &out) const;
 };
 
@@ -83,12 +83,15 @@ struct Signature {
 // - referencedColumns: columns referenced in the expression, used for pruning Gather outputs,
 // populated with extractAllReferencedColumns instead of during the walk
 // - sideEffect: true if the definition contains prohibited operations
+// - creditAwarded: true if the view has been used to rewrite a query and the view's importance
+// factor has been incremented, so that we don't increment it againin the QueryView handler
 // - signature: tables, predicates, projections, and joins found in the expression
 // - intersectMerge: helper function to combine metadata from subtrees
 struct ViewMetadata {
   std::unordered_set<boss::Symbol> dependencies;
   std::unordered_set<boss::Symbol> referencedColumns;
   bool sideEffect = false;
+  bool creditAwarded = false;
   Signature signature;
 
   void intersectMerge(ViewMetadata &&other);

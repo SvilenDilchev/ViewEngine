@@ -1304,7 +1304,7 @@ std::optional<Expression> findRewriting(const Expression &query, ViewMetadata &q
 
   // TODO: look into building a complete reverse index of base table -> top level views that
   // reference it at define time to nuke the search space instead of scanning all views
-  for (const auto &[name, entry] : viewRegistry) {
+  for (auto &[name, entry] : viewRegistry) {
     ViewMetadata viewMeta;
     viewMeta.signature = entry.signature;
     viewMeta.dependencies = entry.dependencies;
@@ -1312,8 +1312,14 @@ std::optional<Expression> findRewriting(const Expression &query, ViewMetadata &q
     expandSignature(viewMeta, cache, seen);
 
     double score = scoreView(viewMeta.signature, queryMetadata.signature);
-    if (score >= 1.0) {
-      boss::ExpressionArguments args;
+
+    if (score > -1.0) {
+      ageEntry(entry);
+      entry.importanceFactor += score;
+    }
+
+    if (score >= 1.0 && entry.cached) {
+      boss::ExpressionArguments args; 
       args.push_back(Symbol(name));
       Expression queryView = ComplexExpression("QueryView"_, {}, std::move(args), {});
       return queryView;

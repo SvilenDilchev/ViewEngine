@@ -5,6 +5,20 @@ std::unordered_map<boss::Symbol, ViewEntry> viewRegistry;
 std::unordered_set<boss::Symbol> evaluationStack;
 std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> tableToViews;
 std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> viewToViews;
+uint64_t veTick = 0;
+
+void ageEntry(ViewEntry &entry) {
+  if (entry.importanceLastAgedTick >= veTick)
+    return;
+
+  // veTick is incremented twice per query
+  uint64_t queriesElapsed = (veTick - entry.importanceLastAgedTick) / 2;
+  if (queriesElapsed == 0)
+    return;
+
+  entry.importanceFactor *= std::pow(IMPORTANCE_DECAY_FACTOR, static_cast<double>(queriesElapsed));
+  entry.importanceLastAgedTick = veTick;
+}
 
 bool hasCycle(const boss::Symbol &newView, const boss::Symbol &current,
               std::unordered_set<boss::Symbol> &visited) {

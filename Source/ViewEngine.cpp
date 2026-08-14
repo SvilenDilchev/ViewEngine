@@ -32,6 +32,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
       // Clear referenced columns if the view definition needs more than what the query needs
       // TODO: re-extract from view definition for proper pruning
       queryMetadata->referencedColumns.clear();
+      queryMetadata->creditAwarded = true;
       return evaluate(std::move(*match), queryMetadata, true, flatten, topLevel);
     }
   }
@@ -141,6 +142,14 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               ViewEntry &entry = it->second;
               std::cerr << "[VE1-diag] QueryView(" << viewName.getName()
                         << ") entry.cached.has_value()=" << entry.cached.has_value() << "\n";
+
+              if (queryMetadata && queryMetadata->creditAwarded) {
+                queryMetadata->creditAwarded = false;
+              } else if (queryMetadata && !queryMetadata->creditAwarded) {
+                // Non-rewritten QueryView, award credit to the view for reuse
+                ageEntry(entry);
+                entry.importanceFactor += 1.0;
+              }
 
               if (flatten) {
                 return evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
@@ -534,6 +543,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
 
 extern "C" BOSSExpression *evaluate(BOSSExpression *e) {
   defaultCacheRegistry.clear();
+  ++veTick;
   auto result = evaluate(std::move(e->delegate), nullptr, false, false, true);
 
   if (defaultCacheRegistry.empty())
