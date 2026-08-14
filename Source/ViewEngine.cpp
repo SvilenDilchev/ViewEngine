@@ -2,10 +2,12 @@
 #include "MetadataRegistry.hpp"
 #include "ViewRegistry.hpp"
 
+#include <iostream>
+
 using boss::expressions::CloneReason;
 
 static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr,
-                           bool skipRewrite = false, bool topLevel = false) {
+                           bool skipRewrite = false, bool flatten = false, bool topLevel = false) {
   // Attempt to rewrite incoming query using view definitions top-down
   // Skip rewrite if incoming expression was generated from a evaluation of a QueryView
   ViewMetadata metadata;
@@ -30,13 +32,13 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
       // Clear referenced columns if the view definition needs more than what the query needs
       // TODO: re-extract from view definition for proper pruning
       queryMetadata->referencedColumns.clear();
-      return evaluate(std::move(*match), queryMetadata, true);
+      return evaluate(std::move(*match), queryMetadata, true, flatten, topLevel);
     }
   }
 
   return std::visit(
       boss::utilities::overload(
-          [queryMetadata, skipRewrite, topLevel](ComplexExpression &&ce) -> Expression {
+          [queryMetadata, skipRewrite, flatten, topLevel](ComplexExpression &&ce) -> Expression {
             auto [head, statics, dynamics, spans] = std::move(ce).decompose();
 
             if (head == "DefineView"_) {
@@ -137,6 +139,13 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                                          viewName.getName());
 
               ViewEntry &entry = it->second;
+              std::cerr << "[VE1-diag] QueryView(" << viewName.getName()
+                        << ") entry.cached.has_value()=" << entry.cached.has_value() << "\n";
+
+              if (flatten) {
+                return evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
+                                queryMetadata, true, true);
+              }
 
               // If cached before, avoid cloning by following borrowed cache protocol to move out
               // and move back in at the second pass of ViewEngine in the pipelines
@@ -150,7 +159,8 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 }
 
                 defaultCacheRegistry[viewName] =
-                    CacheEntry{std::move(*entry.cached), CacheEntryType::Borrowed, integrityMode};
+                    CacheEntry{std::move(*entry.cached), CacheEntryType::Borrowed, integrityMode,
+                               entry.computeCost,        entry.materialiseCost,    entry.reuseCost};
                 entry.cached = std::nullopt;
 
                 return Expression(ComplexExpression("CacheRef"_, {}, std::move(cacheRefArgs), {}));
@@ -175,8 +185,24 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
 
               // Check if already registered to avoid duplicates
               if (!defaultCacheRegistry.count(viewName)) {
-                defaultCacheRegistry[viewName] =
-                    CacheEntry{std::move(result), CacheEntryType::Pending, integrityMode};
+                ExecutionStrategy strategy =
+                    (entry.computeCost > 0.0 || entry.materialiseCost > 0.0)
+                        ? ExecutionStrategy::Standard
+                        : ExecutionStrategy::IsolatedMeasurement;
+
+                Expression entryValue =
+                    strategy == ExecutionStrategy::IsolatedMeasurement
+                        ? evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
+                                   queryMetadata, true, true)
+                        : std::move(result);
+
+                defaultCacheRegistry[viewName] = CacheEntry{std::move(entryValue),
+                                                            CacheEntryType::Pending,
+                                                            integrityMode,
+                                                            entry.computeCost,
+                                                            entry.materialiseCost,
+                                                            entry.reuseCost,
+                                                            strategy};
               }
 
               boss::ExpressionArguments cacheRefArgs;
@@ -201,14 +227,30 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                   throw std::runtime_error("View not found for caching in WithCaches: " +
                                            name.getName());
 
+                it->second.computeCost = entry.computeCost;
+                it->second.materialiseCost = entry.materialiseCost;
+                it->second.reuseCost = entry.reuseCost;
+                std::cerr << "[VE2] " << name.getName() << " write-back (WithCaches loop): "
+                          << "compute=" << it->second.computeCost
+                          << " materialise=" << it->second.materialiseCost
+                          << " reuse=" << it->second.reuseCost << " strategy="
+                          << (entry.executionStrategy == ExecutionStrategy::IsolatedMeasurement
+                                  ? "IsolatedMeasurement"
+                                  : "Standard")
+                          << "\n";
+
                 if (!it->second.cached)
                   it->second.cached = evaluate(std::move(entry.value), queryMetadata, true);
-              }
-              defaultCacheRegistry.clear();
 
+                std::cerr << "[VE2-diag] " << name.getName()
+                          << " cached.has_value()=" << it->second.cached.has_value() << "\n";
+              }
               // Evaluate with the final expression as a top-level expression, so that a CacheRef
               // operator will be correctly handled and cached
-              return evaluate(std::move(finalExpr), queryMetadata, true);
+              auto result = evaluate(std::move(finalExpr), queryMetadata, true);
+              defaultCacheRegistry.clear();
+
+              return result;
             }
 
             // Handle leftover CacheRef operators in the pipeline on second pass
@@ -235,6 +277,15 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                   throw std::runtime_error(
                       "CacheRef could not be resolved, entry not found in cache registry: " +
                       viewName.getName());
+
+                it->second.computeCost = regIt->second.computeCost;
+                it->second.materialiseCost = regIt->second.materialiseCost;
+                it->second.reuseCost = regIt->second.reuseCost;
+                std::cerr << "[VE2] " << viewName.getName() << " write-back (CacheRef fallback): "
+                          << "compute=" << it->second.computeCost
+                          << " materialise=" << it->second.materialiseCost
+                          << " reuse=" << it->second.reuseCost << "\n";
+
                 it->second.cached = evaluate(std::move(regIt->second.value), queryMetadata, true);
               }
 
@@ -425,16 +476,16 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
             // Recursively evaluate arguments of other expressions
             // Do not eval args to preserve definitions for output
             // Check is here to block eval on second pass through ViewEngine in pipeline
-            if (head != "ViewList"_ && head != "TableList"_) {
+            if (head != "ViewList"_ && head != "TableList"_ && head != "ByName"_) {
               for (auto &arg : dynamics) {
-                arg = evaluate(std::move(arg), queryMetadata, skipRewrite);
+                arg = evaluate(std::move(arg), queryMetadata, skipRewrite, flatten);
               }
             }
 
             return Expression(ComplexExpression(std::move(head), std::move(statics),
                                                 std::move(dynamics), std::move(spans)));
           },
-          [queryMetadata](Symbol &&s) -> Expression {
+          [queryMetadata, flatten](Symbol &&s) -> Expression {
             auto viewIt = viewRegistry.find(s);
             if (viewIt != viewRegistry.end()) {
               boss::ExpressionArguments queryViewArgs;
@@ -442,14 +493,21 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               // TODO: implement adaptive caching
               auto rewritten =
                   Expression(ComplexExpression("QueryView"_, {}, std::move(queryViewArgs), {}));
-              return evaluate(std::move(rewritten), queryMetadata);
+              return evaluate(std::move(rewritten), queryMetadata, true, flatten);
             }
 
             auto tableIt = tableRegistry.find(s);
-            if (tableIt == tableRegistry.end() || !tableIt->second.lazy)
-              return Expression(std::move(s));
+            if (tableIt == tableRegistry.end())
+              return Expression(std::move(s)); // Unknown symbol, return as-is
 
             auto const &entry = tableIt->second;
+
+            if (!entry.lazy) {
+              // Eagerly loaded table by ArrowComputeEngine, wrap in ByName operator
+              boss::ExpressionArguments nameArgs;
+              nameArgs.emplace_back(std::move(s));
+              return Expression(ComplexExpression("ByName"_, {}, std::move(nameArgs), {}));
+            }
 
             boss::ExpressionArguments colArgs;
             if (!queryMetadata->referencedColumns.empty() &&
@@ -473,7 +531,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
 
 extern "C" BOSSExpression *evaluate(BOSSExpression *e) {
   defaultCacheRegistry.clear();
-  auto result = evaluate(std::move(e->delegate), nullptr, false, true);
+  auto result = evaluate(std::move(e->delegate), nullptr, false, false, true);
 
   if (defaultCacheRegistry.empty())
     return new BOSSExpression{.delegate = std::move(result)};

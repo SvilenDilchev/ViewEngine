@@ -646,8 +646,11 @@
           (ve-eval (RegisterTable sub_lazy "/data/sub_lazy.tbl" "/lib/loader.so" #t sub_col_a sub_col_b))
           (ve-eval sub_lazy)))
 
-  (test "Eager table symbol passes through unchanged"
-        'sub_eager
+  ;; Eager tables have no bare-symbol resolution mechanism in ACE (only ByName
+  ;; does the lookup against ACE's materialized-name table) - VE wraps the
+  ;; symbol in ByName rather than passing it through unchanged.
+  (test "Eager table symbol is wrapped in ByName"
+        '(ByName sub_eager)
         (begin
           (ve-eval (ClearTables))
           (ve-eval (RegisterTable sub_eager "/data/sub_eager.tbl" "/lib/loader.so" #f sub_eager_col))
@@ -666,8 +669,8 @@
           (ve-eval (RegisterTable sub_filter "/data/sub_filter.tbl" "/lib/loader.so" #t sub_filter_col))
           (ve-eval (Filter sub_filter (Greater sub_filter_col 5)))))
 
-  (test "Eager table symbol inside expression passes through unchanged"
-        '(Filter sub_eager2 (Greater sub_eager2_col 5))
+  (test "Eager table symbol inside expression is wrapped in ByName"
+        '(Filter (ByName sub_eager2) (Greater sub_eager2_col 5))
         (begin
           (ve-eval (ClearTables))
           (ve-eval (RegisterTable sub_eager2 "/data/sub_eager2.tbl" "/lib/loader.so" #f sub_eager2_col))
@@ -774,8 +777,8 @@
           (ve-eval (RegisterTable cp4_tbl "/data/cp4.tbl" "/lib/loader.so" #t cp4_a cp4_b cp4_c))
           (ve-eval cp4_tbl)))
 
-  (test "Eager table is not affected by column pruning"
-        '(Project cp5_tbl cp5_a)
+  (test "Eager table is not affected by column pruning, wrapped in ByName"
+        '(Project (ByName cp5_tbl) cp5_a)
         (begin
           (ve-eval (ClearTables))
           (ve-eval (RegisterTable cp5_tbl "/data/cp5.tbl" "/lib/loader.so" #f cp5_a cp5_b cp5_c))
@@ -790,7 +793,7 @@
   ;; --- Side-swap canonicalisation for INNER joins ---
 
   (test "Inner join with swapped sides still matches view"
-        '(Join customers orders (Equal customer_id order_customer_id))
+        '(Join (ByName customers) (ByName orders) (Equal customer_id order_customer_id))
         (begin
           (ve-eval (RegisterTable customers "/data/customers.tbl" "/lib/loader.so" #f customer_id customer_name))
           (ve-eval (RegisterTable orders "/data/orders.tbl" "/lib/loader.so" #f order_id order_customer_id))
@@ -802,7 +805,7 @@
   ;; --- Predicate-pair order independence within a fixed side ---
 
   (test "Multi-predicate inner join matches regardless of predicate order"
-        '(Join shipments containers (Equal shipment_port container_port) (Equal shipment_date container_date))
+        '(Join (ByName shipments) (ByName containers) (Equal shipment_port container_port) (Equal shipment_date container_date))
         (begin
           (ve-eval (RegisterTable shipments "/data/shipments.tbl" "/lib/loader.so" #f shipment_port shipment_date))
           (ve-eval (RegisterTable containers "/data/containers.tbl" "/lib/loader.so" #f container_port container_date))
@@ -814,7 +817,7 @@
   ;; --- Combined: both swapped sides AND swapped predicate order at once ---
 
   (test "Inner join matches with both sides and predicate order swapped"
-        '(Join employees departments (Equal employee_dept_x dept_x) (Equal employee_dept_y dept_y))
+        '(Join (ByName employees) (ByName departments) (Equal employee_dept_x dept_x) (Equal employee_dept_y dept_y))
         (begin
           (ve-eval (RegisterTable employees "/data/employees.tbl" "/lib/loader.so" #f employee_dept_x employee_dept_y))
           (ve-eval (RegisterTable departments "/data/departments.tbl" "/lib/loader.so" #f dept_x dept_y))
@@ -825,7 +828,7 @@
   ;; --- Regression: LEFT/ANTI joins must NOT be side-swapped ---
 
   (test "LeftJoin with swapped sides does not match (semantics differ)"
-        '(LeftJoin returns products (Equal return_product_id product_id))
+        '(LeftJoin (ByName returns) (ByName products) (Equal return_product_id product_id))
         (begin
           (ve-eval (RegisterTable products "/data/products.tbl" "/lib/loader.so" #f product_id product_name))
           (ve-eval (RegisterTable returns "/data/returns.tbl" "/lib/loader.so" #f return_id return_product_id))
@@ -836,7 +839,7 @@
   ;; --- Sanity: unmatched inner join (different tables) must not spuriously match ---
 
   (test "Inner join over unrelated tables does not match unrelated view"
-        '(Join suppliers warehouses (Equal supplier_id warehouse_supplier_id))
+        '(Join (ByName suppliers) (ByName warehouses) (Equal supplier_id warehouse_supplier_id))
         (begin
           (ve-eval (RegisterTable suppliers "/data/suppliers.tbl" "/lib/loader.so" #f supplier_id))
           (ve-eval (RegisterTable warehouses "/data/warehouses.tbl" "/lib/loader.so" #f warehouse_supplier_id))
@@ -845,8 +848,8 @@
   ;; --- View-on-view dependency chain, exercises recursive expandSignature/cache path ---
 
   (test "Inner join matches through a nested view dependency, sides and predicates reversed"
-        '(Join (Join customers orders (Equal customer_id order_customer_id))
-               payments (Equal order_customer_id payment_customer_id))
+        '(Join (Join (ByName customers) (ByName orders) (Equal customer_id order_customer_id))
+               (ByName payments) (Equal order_customer_id payment_customer_id))
         (begin
           (ve-eval (RegisterTable payments "/data/payments.tbl" "/lib/loader.so" #f payment_id payment_customer_id))
           (ve-eval (DefineView CUSTOMER_ORDERS_L1
@@ -860,7 +863,7 @@
   ;; --- Mixed equi-join + residual (non-equi) predicate ---
 
   (test "Inner join with mixed equi + residual predicate matches regardless of predicate order"
-        '(Join products returns (Equal product_id return_product_id) (Greater product_price 5))
+        '(Join (ByName products) (ByName returns) (Equal product_id return_product_id) (Greater product_price 5))
         (begin
           (ve-eval (DefineView PRODUCT_RETURNS_FILTERED_VIEW
               (Join products returns (Equal product_id return_product_id) (Greater product_price 5))))
@@ -879,7 +882,7 @@
              pr_return_id pr_return_product_id))
 
   (test "Predicate-only residual: extra Filter applied on top of resolved view"
-        '(Filter (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+        '(Filter (Join (ByName pr_products) (ByName pr_returns) (Equal pr_product_id pr_return_product_id))
                  (Greater pr_product_price 5))
         (begin
           (ve-eval (ClearViews))
@@ -891,7 +894,7 @@
 
   (test "Projection-only residual: view over-projects, query narrows via residual Project"
         '(Project
-          (Project (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+          (Project (Join (ByName pr_products) (ByName pr_returns) (Equal pr_product_id pr_return_product_id))
                     pr_product_id pr_product_name pr_product_price pr_return_id)
           pr_product_id)
         (begin
@@ -905,7 +908,7 @@
 
   (test "Combined residual: Filter innermost, Project outermost, wrapping resolved view"
         '(Project
-          (Filter (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+          (Filter (Join (ByName pr_products) (ByName pr_returns) (Equal pr_product_id pr_return_product_id))
                   (Greater pr_product_price 5))
           pr_product_id)
         (begin
@@ -919,7 +922,7 @@
               pr_product_id))))
 
   (test "Not rewritable: view missing a projected column leaves query unchanged"
-        '(Project (Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+        '(Project (Join (ByName pr_products) (ByName pr_returns) (Equal pr_product_id pr_return_product_id))
                    pr_product_id pr_product_price)
         (begin
           (ve-eval (ClearViews))
@@ -931,7 +934,7 @@
               pr_product_id pr_product_price))))
               
   (test "Not rewritable: view predicate absent from query is not silently applied"
-        '(Join pr_products pr_returns (Equal pr_product_id pr_return_product_id))
+        '(Join (ByName pr_products) (ByName pr_returns) (Equal pr_product_id pr_return_product_id))
         (begin
           (ve-eval (ClearViews))
           (ve-eval (DefineView PR_FILTERED_VIEW
@@ -954,7 +957,7 @@
   ;; --- View domain strictly weaker than query domain: must match with residual ---
 
   (test "View with Greater(price,50) matches query needing Greater(price,100), residual added"
-        '(Filter (Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+        '(Filter (Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
                           (Greater dp_product_price 50))
                  (Greater dp_product_price 100))
         (begin
@@ -970,7 +973,7 @@
   ;; --- View domain strictly stronger than query domain: must NOT match ---
 
   (test "View with Greater(price,100) does not cover query needing Greater(price,50)"
-        '(Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+        '(Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
                  (Greater dp_product_price 50))
         (begin
           (ve-eval (ClearViews))
@@ -985,7 +988,7 @@
   ;; --- Exact domain match: no residual should be added ---
 
   (test "View with exact same domain predicate as query needs no residual"
-        '(Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+        '(Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
                  (Greater dp_product_price 50))
         (begin
           (ve-eval (ClearViews))
@@ -1000,7 +1003,7 @@
   ;; --- Between covered by an equivalent view built from two comparisons ---
 
   (test "View with Greater+Less matches query needing a narrower Between"
-        '(Filter (Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+        '(Filter (Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
                           (And (Greater dp_product_price 10) (Less dp_product_price 50)))
                  (Between dp_product_price 20 30))
         (begin
@@ -1016,7 +1019,7 @@
   ;; --- Unrestricted view column vs query domain: usable but residual still needed ---
 
   (test "View unrestricted on price still needs residual Filter for query's Greater"
-        '(Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+        '(Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
                  (Greater dp_product_price 5))
         (begin
           (ve-eval (ClearViews))
@@ -1029,7 +1032,7 @@
   ;; --- Single-column Or: real domain union, should match a subset request ---
 
   (test "View with Or on same column (union) matches a query needing a subset range"
-        '(Filter (Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+        '(Filter (Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
                           (Or (Less dp_product_price 10) (Greater dp_product_price 5)))
                  (Greater dp_product_price 5))
         (begin
@@ -1045,7 +1048,7 @@
   ;; --- Cross-column Or: opaque fallback, only exact same expression should match ---
 
   (test "View with cross-column Or matches only exact same Or expression in query"
-        '(Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+        '(Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
                  (Or (Greater dp_product_price 5) (Greater dp_return_id 10)))
         (begin
           (ve-eval (ClearViews))
@@ -1058,7 +1061,7 @@
               (Or (Greater dp_product_price 5) (Greater dp_return_id 10))))))
 
   (test "View with cross-column Or does not match a differently-shaped query predicate"
-        '(Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+        '(Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
                  (Greater dp_product_price 5))
         (begin
           (ve-eval (ClearViews))
@@ -1073,7 +1076,7 @@
   ;; --- NotEqual: split-range domain ---
 
   (test "View with matching NotEqual needs no residual"
-        '(Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+        '(Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
                  (NotEqual dp_product_price 5))
         (begin
           (ve-eval (ClearViews))
@@ -1086,7 +1089,7 @@
               (NotEqual dp_product_price 5)))))
 
   (test "View with NotEqual(5) covers query needing Greater(10) via subset range, residual added"
-        '(Filter (Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+        '(Filter (Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
                           (NotEqual dp_product_price 5))
                  (Greater dp_product_price 10))
         (begin
@@ -1102,8 +1105,8 @@
   ;; --- LEFT JOIN with a pre-filtered right (destructive) side: rewriting must be blocked ---
 
   (test "View is a LeftJoin with filtered right side - query against it is not rewritten"
-        '(LeftJoin dp_products
-             (Filter dp_returns (Greater dp_return_id 100))
+        '(LeftJoin (ByName dp_products)
+             (Filter (ByName dp_returns) (Greater dp_return_id 100))
              (Equal dp_product_id dp_return_product_id))
         (begin
           (ve-eval (ClearViews))
@@ -1118,7 +1121,7 @@
   ;; --- Regression: exact base-table/join match but unrestricted domain column must still residual ---
 
   (test "Regression: unrestricted view on filtered column always produces residual, never bare QueryView"
-        '(Filter (Join dp_products dp_returns (Equal dp_product_id dp_return_product_id))
+        '(Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
                  (Greater dp_product_price 5))
         (begin
           (ve-eval (ClearViews))

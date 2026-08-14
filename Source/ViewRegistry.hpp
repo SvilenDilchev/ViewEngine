@@ -10,6 +10,10 @@ struct ViewEntry {
   Expression definition;
   std::unordered_set<boss::Symbol> dependencies;
   Signature signature;
+
+  double computeCost = 0.0;
+  double materialiseCost = 0.0;
+  double reuseCost = 0.0;
 };
 
 extern std::unordered_map<boss::Symbol, ViewEntry> viewRegistry; // In memory register of Views
