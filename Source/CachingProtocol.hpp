@@ -74,6 +74,7 @@ struct CacheEntry {
   double computeCost = 0.0;
   double materialiseCost = 0.0;
   double reuseCost = 0.0;
+  double marginalComputeCost = 0.0; // Cost of computing on top of its materialised dependencies
 
   ExecutionStrategy executionStrategy = ExecutionStrategy::Standard;
 };
@@ -114,19 +115,21 @@ inline Expression unpackWithCaches(Expression &&expr, CacheRegistry &registry) {
     auto computeCost = std::get<double>(wDynamics[2]);
     auto materialiseCost = std::get<double>(wDynamics[3]);
     auto reuseCost = std::get<double>(wDynamics[4]);
-    auto executionStrategy = std::get<Symbol>(wDynamics[5]) == "IsolatedMeasurement"_
+    auto marginalComputeCost = std::get<double>(wDynamics[5]);
+    auto executionStrategy = std::get<Symbol>(wDynamics[6]) == "IsolatedMeasurement"_
                                  ? ExecutionStrategy::IsolatedMeasurement
                                  : ExecutionStrategy::Standard;
 
     std::optional<IntegrityCheckMode> mode = std::nullopt;
-    if (type == CacheEntryType::Borrowed && wDynamics.size() >= 7) {
-      auto const &modeSym = std::get<Symbol>(wDynamics[6]);
+    if (type == CacheEntryType::Borrowed && wDynamics.size() >= 8) {
+      auto const &modeSym = std::get<Symbol>(wDynamics[7]);
       mode =
           modeSym == "Structural"_ ? IntegrityCheckMode::Structural : IntegrityCheckMode::Content;
     }
 
     registry[std::move(name)] = CacheEntry{
-        std::move(value), type, mode, computeCost, materialiseCost, reuseCost, executionStrategy};
+        std::move(value), type, mode, computeCost, materialiseCost, reuseCost, marginalComputeCost,
+        executionStrategy};
   }
 
   return std::move(dynamics[numArgs - 1]);
@@ -141,12 +144,13 @@ inline Expression repackWithCaches(CacheRegistry &&registry, Expression &&finalE
   for (auto &&[name, entry] : registry) {
     boss::ExpressionArguments wrapperArgs;
     auto const &mode = entry.integrityMode;
-    wrapperArgs.reserve(mode ? 7u : 6u);
+    wrapperArgs.reserve(mode ? 8u : 7u);
     wrapperArgs.emplace_back(name);
     wrapperArgs.emplace_back(std::move(entry.value));
     wrapperArgs.emplace_back(entry.computeCost);
     wrapperArgs.emplace_back(entry.materialiseCost);
     wrapperArgs.emplace_back(entry.reuseCost);
+    wrapperArgs.emplace_back(entry.marginalComputeCost);
     wrapperArgs.emplace_back(entry.executionStrategy == ExecutionStrategy::IsolatedMeasurement
                                  ? "IsolatedMeasurement"_
                                  : "Standard"_);
