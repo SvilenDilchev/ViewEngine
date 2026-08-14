@@ -66,6 +66,8 @@ struct CacheEntry {
   std::optional<IntegrityCheckMode>
       integrityMode; // guideline for engines, not a strict requirement
 
+  ExecutionStrategy executionStrategy = ExecutionStrategy::Standard;
+
   // Running cost totals of wall time sprent producing or reusing this entry, accumulated by each
   // engine that touches it during the pipeline pass. Each engine is responsible to accurately
   // separate the time spent computing the entry vs. the time spent materialising it as an
@@ -75,8 +77,6 @@ struct CacheEntry {
   double materialiseCost = 0.0;
   double reuseCost = 0.0;
   double marginalComputeCost = 0.0; // Cost of computing on top of its materialised dependencies
-
-  ExecutionStrategy executionStrategy = ExecutionStrategy::Standard;
 };
 
 // Registry mapping view names to cache entries. The registry is not about persistance, but
@@ -112,14 +112,13 @@ inline Expression unpackWithCaches(Expression &&expr, CacheRegistry &registry) {
 
     auto name = std::get<Symbol>(std::move(wDynamics[0]));
     auto value = std::move(wDynamics[1]);
-    auto computeCost = std::get<double>(wDynamics[2]);
-    auto materialiseCost = std::get<double>(wDynamics[3]);
-    auto reuseCost = std::get<double>(wDynamics[4]);
-    auto marginalComputeCost = std::get<double>(wDynamics[5]);
-    auto executionStrategy = std::get<Symbol>(wDynamics[6]) == "IsolatedMeasurement"_
+    auto executionStrategy = std::get<Symbol>(wDynamics[2]) == "IsolatedMeasurement"_
                                  ? ExecutionStrategy::IsolatedMeasurement
                                  : ExecutionStrategy::Standard;
-
+    auto computeCost = std::get<double>(wDynamics[3]);
+    auto materialiseCost = std::get<double>(wDynamics[4]);
+    auto reuseCost = std::get<double>(wDynamics[5]);
+    auto marginalComputeCost = std::get<double>(wDynamics[6]);
     std::optional<IntegrityCheckMode> mode = std::nullopt;
     if (type == CacheEntryType::Borrowed && wDynamics.size() >= 8) {
       auto const &modeSym = std::get<Symbol>(wDynamics[7]);
@@ -128,8 +127,8 @@ inline Expression unpackWithCaches(Expression &&expr, CacheRegistry &registry) {
     }
 
     registry[std::move(name)] = CacheEntry{
-        std::move(value), type, mode, computeCost, materialiseCost, reuseCost, marginalComputeCost,
-        executionStrategy};
+        std::move(value),   type, mode, executionStrategy, computeCost, materialiseCost, reuseCost,
+        marginalComputeCost};
   }
 
   return std::move(dynamics[numArgs - 1]);
@@ -147,13 +146,13 @@ inline Expression repackWithCaches(CacheRegistry &&registry, Expression &&finalE
     wrapperArgs.reserve(mode ? 8u : 7u);
     wrapperArgs.emplace_back(name);
     wrapperArgs.emplace_back(std::move(entry.value));
+    wrapperArgs.emplace_back(entry.executionStrategy == ExecutionStrategy::IsolatedMeasurement
+                                 ? "IsolatedMeasurement"_
+                                 : "Standard"_);
     wrapperArgs.emplace_back(entry.computeCost);
     wrapperArgs.emplace_back(entry.materialiseCost);
     wrapperArgs.emplace_back(entry.reuseCost);
     wrapperArgs.emplace_back(entry.marginalComputeCost);
-    wrapperArgs.emplace_back(entry.executionStrategy == ExecutionStrategy::IsolatedMeasurement
-                                 ? "IsolatedMeasurement"_
-                                 : "Standard"_);
     if (mode) {
       wrapperArgs.emplace_back(*mode == IntegrityCheckMode::Structural ? "Structural"_
                                                                        : "Content"_);

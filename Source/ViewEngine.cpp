@@ -168,8 +168,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 }
 
                 defaultCacheRegistry[viewName] =
-                    CacheEntry{std::move(*entry.cached), CacheEntryType::Borrowed, integrityMode,
-                               entry.computeCost,        entry.materialiseCost,    entry.reuseCost};
+                    CacheEntry{std::move(*entry.cached), CacheEntryType::Borrowed, integrityMode};
                 entry.cached = std::nullopt;
 
                 return Expression(ComplexExpression("CacheRef"_, {}, std::move(cacheRefArgs), {}));
@@ -205,13 +204,12 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                                    queryMetadata, true, true)
                         : std::move(result);
 
-                defaultCacheRegistry[viewName] = CacheEntry{std::move(entryValue),
-                                                            CacheEntryType::Pending,
-                                                            integrityMode,
-                                                            entry.computeCost,
-                                                            entry.materialiseCost,
-                                                            entry.reuseCost,
-                                                            strategy};
+                defaultCacheRegistry[viewName] = CacheEntry{
+                    std::move(entryValue),
+                    CacheEntryType::Pending,
+                    integrityMode,
+                    strategy,
+                };
               }
 
               boss::ExpressionArguments cacheRefArgs;
@@ -236,13 +234,15 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                   throw std::runtime_error("View not found for caching in WithCaches: " +
                                            name.getName());
 
-                it->second.computeCost = entry.computeCost;
-                it->second.materialiseCost = entry.materialiseCost;
-                it->second.reuseCost = entry.reuseCost;
+                storeIfPositive(it->second.computeCost, entry.computeCost);
+                storeIfPositive(it->second.materialiseCost, entry.materialiseCost);
+                storeIfPositive(it->second.reuseCost, entry.reuseCost);
+                storeIfPositive(it->second.marginalComputeCost, entry.marginalComputeCost);
                 std::cerr << "[VE2] " << name.getName() << " write-back (WithCaches loop): "
                           << "compute=" << it->second.computeCost
                           << " materialise=" << it->second.materialiseCost
-                          << " reuse=" << it->second.reuseCost << " strategy="
+                          << " reuse=" << it->second.reuseCost
+                          << " marginalCompute=" << it->second.marginalComputeCost << " strategy="
                           << (entry.executionStrategy == ExecutionStrategy::IsolatedMeasurement
                                   ? "IsolatedMeasurement"
                                   : "Standard")
@@ -289,13 +289,15 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                       "CacheRef could not be resolved, entry not found in cache registry: " +
                       viewName.getName());
 
-                it->second.computeCost = regIt->second.computeCost;
-                it->second.materialiseCost = regIt->second.materialiseCost;
-                it->second.reuseCost = regIt->second.reuseCost;
+                storeIfPositive(it->second.computeCost, regIt->second.computeCost);
+                storeIfPositive(it->second.materialiseCost, regIt->second.materialiseCost);
+                storeIfPositive(it->second.reuseCost, regIt->second.reuseCost);
+                storeIfPositive(it->second.marginalComputeCost, regIt->second.marginalComputeCost);
                 std::cerr << "[VE2] " << viewName.getName() << " write-back (CacheRef fallback): "
                           << "compute=" << it->second.computeCost
                           << " materialise=" << it->second.materialiseCost
-                          << " reuse=" << it->second.reuseCost << "\n";
+                          << " reuse=" << it->second.reuseCost
+                          << " marginalCompute=" << it->second.marginalComputeCost << "\n";
 
                 it->second.size = computeSize(regIt->second.value);
                 it->second.cached = evaluate(std::move(regIt->second.value), queryMetadata, true);

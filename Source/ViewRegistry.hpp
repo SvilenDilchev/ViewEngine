@@ -11,14 +11,16 @@ struct ViewEntry {
   std::unordered_set<boss::Symbol> dependencies;
   Signature signature;
 
+  // Cost metrics corresponding to cache entry costs
   double computeCost = 0.0;
   double materialiseCost = 0.0;
   double reuseCost = 0.0;
+  double marginalComputeCost = 0.0;
 
   double size = 0.0; // Size of the materialised view in bytes
 
-  double importanceFactor = 0.0;       // Used to rank views for eviction from cache
-  uint64_t importanceLastAgedTick = 0; // Last tick (global query count) when importance was aged
+  double importanceFactor = 0.0;        // Used to rank views for eviction from cache
+  uint64_t importanceLastAgedQuery = 0; // Last query when importance was aged
 };
 
 extern std::unordered_map<boss::Symbol, ViewEntry> viewRegistry; // In memory register of Views
@@ -48,6 +50,9 @@ bool hasCycle(const boss::Symbol &newView, const boss::Symbol &current,
 // Invalidate caches of all views that directly or indirectly depend on the given view
 void invalidateDependentCaches(const boss::Symbol &invalidatedView,
                                std::unordered_set<boss::Symbol> &seen);
+
+// Checks if the new value is > 0.0 and updates the target field if so
+void storeIfPositive(double &target, const double newValue);
 
 // Compute the size of a view after evaluating it.
 // The result must be a table expression, otherwise an exception is thrown.

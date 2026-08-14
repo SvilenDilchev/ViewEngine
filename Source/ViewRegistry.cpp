@@ -8,16 +8,14 @@ std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> viewToViews;
 uint64_t veTick = 0;
 
 void ageEntry(ViewEntry &entry) {
-  if (entry.importanceLastAgedTick >= veTick)
-    return;
+  uint64_t currentQuery = (veTick + 1) / 2; // VE1 and VE2 both result in the same query idx;
+  if (currentQuery <= entry.importanceLastAgedQuery)
+    return; // Still the same query, no need to age again
 
   // veTick is incremented twice per query
-  uint64_t queriesElapsed = (veTick - entry.importanceLastAgedTick) / 2;
-  if (queriesElapsed == 0)
-    return;
-
+  uint64_t queriesElapsed = currentQuery - entry.importanceLastAgedQuery;
   entry.importanceFactor *= std::pow(IMPORTANCE_DECAY_FACTOR, static_cast<double>(queriesElapsed));
-  entry.importanceLastAgedTick = veTick;
+  entry.importanceLastAgedQuery = currentQuery;
 }
 
 bool hasCycle(const boss::Symbol &newView, const boss::Symbol &current,
@@ -55,6 +53,11 @@ void invalidateDependentCaches(const boss::Symbol &invalidatedView,
       vit->second.cached = std::nullopt;
     invalidateDependentCaches(dependent, seen);
   }
+}
+
+void storeIfPositive(double &target, const double newValue) {
+  if (newValue > 0.0)
+    target = newValue;
 }
 
 // Table size computation
