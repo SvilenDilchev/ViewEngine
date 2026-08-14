@@ -14,6 +14,8 @@ struct ViewEntry {
   double computeCost = 0.0;
   double materialiseCost = 0.0;
   double reuseCost = 0.0;
+
+  double size = 0.0;
 };
 
 extern std::unordered_map<boss::Symbol, ViewEntry> viewRegistry; // In memory register of Views
@@ -33,3 +35,7 @@ bool hasCycle(const boss::Symbol &newView, const boss::Symbol &current,
 // Invalidate caches of all views that directly or indirectly depend on the given view
 void invalidateDependentCaches(const boss::Symbol &invalidatedView,
                                std::unordered_set<boss::Symbol> &seen);
+
+// Compute the size of a view after evaluating it.
+// The result must be a table expression, otherwise an exception is thrown.
+double computeSize(Expression const &tableExpr);

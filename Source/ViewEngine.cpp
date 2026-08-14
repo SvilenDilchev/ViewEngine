@@ -239,8 +239,10 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                                   : "Standard")
                           << "\n";
 
-                if (!it->second.cached)
+                if (!it->second.cached) {
+                  it->second.size = computeSize(entry.value);
                   it->second.cached = evaluate(std::move(entry.value), queryMetadata, true);
+                }
 
                 std::cerr << "[VE2-diag] " << name.getName()
                           << " cached.has_value()=" << it->second.cached.has_value() << "\n";
@@ -286,6 +288,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                           << " materialise=" << it->second.materialiseCost
                           << " reuse=" << it->second.reuseCost << "\n";
 
+                it->second.size = computeSize(regIt->second.value);
                 it->second.cached = evaluate(std::move(regIt->second.value), queryMetadata, true);
               }
 
