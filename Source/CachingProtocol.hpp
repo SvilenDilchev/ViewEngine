@@ -37,6 +37,10 @@ enum class ExecutionStrategy {
                        // of this expression alone.
 };
 
+// Used by the view engine to allow users to specify whether a view should be cached or not, or to
+// defer the decision to the engine
+enum class CachingDecision { Admit, Reject, Defer };
+
 // Optional optimisation guideline for engines to follow while connecting their own caching logic to
 // this protocol. Designed to help engines identify when it is safe to use their own cached results
 // for the incoming BOSS expression, instead of reevaluating it. However, engines can always
@@ -110,6 +114,20 @@ inline std::optional<ExecutionStrategy> symbolToExecutionStrategy(Symbol const &
     return ExecutionStrategy::Standard;
   if (s == "IsolatedMeasurement"_)
     return ExecutionStrategy::IsolatedMeasurement;
+  return std::nullopt;
+}
+
+// Helper functions to convert symbol to enum for caching decision
+inline std::optional<CachingDecision> symbolToCachingDecision(Symbol const *s) {
+  using boss::utilities::operator""_;
+  if (s == nullptr)
+    return std::nullopt;
+  if (*s == "Admit"_)
+    return CachingDecision::Admit;
+  if (*s == "Reject"_)
+    return CachingDecision::Reject;
+  if (*s == "Defer"_)
+    return CachingDecision::Defer;
   return std::nullopt;
 }
 

@@ -1,9 +1,11 @@
-#include "AdmissionPolicy.hpp"
+#include "Cache.hpp"
 #include "CachingProtocol.hpp"
 #include "MetadataRegistry.hpp"
 #include "ViewRegistry.hpp"
 
 #include <iostream>
+#include <unordered_set>
+#include <utility>
 
 using boss::expressions::CloneReason;
 
@@ -77,6 +79,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
 
               // Remove old index entries if view already exists
               if (auto existing = viewRegistry.find(viewName); existing != viewRegistry.end()) {
+                viewCacheOccupancy -= existing->second.size; // Remove old size from occupancy
                 for (const auto &tableName : existing->second.signature.baseTables)
                   tableToViews[tableName].erase(viewName);
                 for (const auto &dep : existing->second.dependencies)
@@ -94,8 +97,9 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               for (const auto &dep : metadata.dependencies)
                 viewToViews[dep].insert(viewName);
 
+              viewCache.erase(viewName); // Invalidate the cache for the view itself
               viewRegistry[std::move(viewName)] =
-                  ViewEntry{std::nullopt, std::move(dynamics[1]), std::move(metadata.dependencies),
+                  ViewEntry{std::move(dynamics[1]), std::move(metadata.dependencies),
                             std::move(metadata.signature)};
 
               return Expression(true);
@@ -109,13 +113,38 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               if (!name)
                 throw std::runtime_error("QueryView first argument must be a symbol");
 
-              bool shouldCache = false;
-              if (dynamics.size() >= 2) {
-                auto *flag = std::get_if<bool>(&dynamics[1]);
-                if (!flag)
-                  throw std::runtime_error("QueryView second argument must be a boolean");
-                shouldCache = *flag;
+              auto viewName = std::move(*name);
+              auto it = viewRegistry.find(viewName);
+              if (it == viewRegistry.end())
+                throw std::runtime_error("View not found: " + viewName.getName());
+
+              if (evaluationStack.count(viewName))
+                throw std::runtime_error("Circular view dependency detected: " +
+                                         viewName.getName());
+
+              ViewEntry &entry = it->second;
+              std::cerr << "[VE1-diag] QueryView(" << viewName.getName()
+                        << ") entry.cached.has_value()=" << viewCache.count(viewName) << "\n";
+
+              evaluationStack.insert(viewName);
+              struct EvaluationGuard { // RAII guard for evaluation stack cleanup
+                boss::Symbol viewName;
+                ~EvaluationGuard() { evaluationStack.erase(viewName); }
+              } guard{viewName};
+
+              if (flatten) {
+                return evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
+                                queryMetadata, true, true);
               }
+
+              if (dynamics.size() < 2)
+                throw std::runtime_error(
+                    "QueryView requires a caching decision (Admit, Reject, Defer) argument");
+
+              auto decision = symbolToCachingDecision(std::get_if<Symbol>(&dynamics[1]));
+              if (!decision)
+                throw std::runtime_error(
+                    "QueryView second argument must be a symbol: Admit, Reject, or Defer");
 
               std::optional<ExecutionStrategy> forcedStrategy = std::nullopt;
               if (dynamics.size() >= 3) {
@@ -138,24 +167,6 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                   throw std::runtime_error("QueryView unknown integrity mode: " + mode->getName());
               }
 
-              auto viewName = std::move(*name);
-              auto it = viewRegistry.find(viewName);
-              if (it == viewRegistry.end())
-                throw std::runtime_error("View not found: " + viewName.getName());
-
-              if (evaluationStack.count(viewName))
-                throw std::runtime_error("Circular view dependency detected: " +
-                                         viewName.getName());
-
-              ViewEntry &entry = it->second;
-              std::cerr << "[VE1-diag] QueryView(" << viewName.getName()
-                        << ") entry.cached.has_value()=" << entry.cached.has_value() << "\n";
-
-              if (flatten) {
-                return evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
-                                queryMetadata, true, true);
-              }
-
               if (queryMetadata && queryMetadata->creditAwarded) {
                 queryMetadata->creditAwarded = false;
               } else if (queryMetadata && !queryMetadata->creditAwarded) {
@@ -164,11 +175,30 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 entry.importanceFactor += 1.0;
               }
 
+              // If the user has explicitly specified a caching decision, we respect that and
+              // override any automatic decision Cannot override a user decision with an automatic
+              // one If view is called multiple times in the same query, we keep the last decision
+              if (decision != CachingDecision::Defer) {
+                entry.cachingDecision = *decision;
+              }
+
+              // Short circuit repeated references to the same view in the same query
+              // Read the cache registry to see the type of the view, and if it is Borrowed or
+              // Pending so we correctly return the same type of cache ref for the same view
+              if (auto existing = defaultCacheRegistry.find(viewName);
+                  existing != defaultCacheRegistry.end()) {
+                boss::ExpressionArguments cacheRefArgs;
+                cacheRefArgs.emplace_back(viewName);
+                cacheRefArgs.emplace_back(
+                    existing->second.type == CacheEntryType::Borrowed ? "Borrowed"_ : "Pending"_);
+                return Expression(ComplexExpression("CacheRef"_, {}, std::move(cacheRefArgs), {}));
+              }
+
               // If cached before, avoid cloning by following borrowed cache protocol to move out
               // and move back in at the second pass of ViewEngine in the pipelines
               // TODO: allow the user to explicitly prefer recalculating the view instead of using
               // the cached value
-              if (entry.cached) {
+              if (viewCache.count(viewName)) {
                 boss::ExpressionArguments cacheRefArgs;
                 cacheRefArgs.emplace_back(viewName);
                 cacheRefArgs.emplace_back("Borrowed"_);
@@ -177,25 +207,17 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                       ComplexExpression("CacheRef"_, {}, std::move(cacheRefArgs), {}));
                 }
 
-                defaultCacheRegistry[viewName] =
-                    CacheEntry{std::move(*entry.cached), CacheEntryType::Borrowed, integrityMode};
-                entry.cached = std::nullopt;
+                defaultCacheRegistry[viewName] = CacheEntry{
+                    std::move(viewCache[viewName]), CacheEntryType::Borrowed, integrityMode};
+                viewCacheOccupancy -= entry.size; // borrowed view is no longer occupying the cache
+                viewCache.erase(viewName);
 
                 return Expression(ComplexExpression("CacheRef"_, {}, std::move(cacheRefArgs), {}));
               }
 
-              evaluationStack.insert(viewName);
-              struct EvaluationGuard { // RAII guard for evaluation stack cleanup
-                boss::Symbol viewName;
-                ~EvaluationGuard() { evaluationStack.erase(viewName); }
-              } guard{viewName};
-
               // Cache miss
               auto result = evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
                                      queryMetadata, true);
-
-              // Mark the decision to cache for VE2 to handle
-              entry.shouldCache = shouldCache;
 
               // Check if already registered to avoid duplicates
               if (!defaultCacheRegistry.count(viewName)) {
@@ -234,50 +256,97 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                                                std::move(dynamics), std::move(spans))),
                   defaultCacheRegistry);
 
+              // Phase 1: Collect all execution measurements
               for (auto &[name, entry] : defaultCacheRegistry) {
                 auto it = viewRegistry.find(name);
                 if (it == viewRegistry.end())
                   throw std::runtime_error("View not found for caching in WithCaches: " +
                                            name.getName());
 
-                if (!it->second.cached) {
-                  storeIfPositive(it->second.computeCost, entry.computeCost);
-                  storeIfPositive(it->second.materialiseCost, entry.materialiseCost);
-                  storeIfPositive(it->second.reuseCost, entry.reuseCost);
-                  storeIfPositive(it->second.marginalComputeCost, entry.marginalComputeCost);
-                  it->second.size = computeSize(entry.value);
-                  std::cerr << "[VE2] " << name.getName() << " write-back (WithCaches loop): "
-                            << "compute=" << it->second.computeCost
-                            << " materialise=" << it->second.materialiseCost
-                            << " reuse=" << it->second.reuseCost
-                            << " marginalCompute=" << it->second.marginalComputeCost << " strategy="
-                            << (entry.executionStrategy == ExecutionStrategy::IsolatedMeasurement
-                                    ? "IsolatedMeasurement"
-                                    : "Standard")
-                            << " size=" << it->second.size << "\n";
-
-                  if (!it->second.admissionDecided) {
-                    // TODO: actual benefit cost analysis leading to a decision
-                    it->second.shouldCache = true;
-                    it->second.admissionDecided = true;
-                  }
-
-                  if (entry.type == CacheEntryType::Borrowed || it->second.shouldCache)
-                    it->second.cached = evaluate(std::move(entry.value), queryMetadata, true);
-                }
-
-                std::cerr << "[VE2-diag] " << name.getName()
-                          << " cached.has_value()=" << it->second.cached.has_value() << "\n";
+                storeIfPositive(it->second.computeCost, entry.computeCost);
+                storeIfPositive(it->second.materialiseCost, entry.materialiseCost);
+                storeIfPositive(it->second.reuseCost, entry.reuseCost);
+                storeIfPositive(it->second.marginalComputeCost, entry.marginalComputeCost);
+                it->second.size = computeSize(entry.value);
               }
-              // Evaluate with the final expression as a top-level expression, so that a CacheRef
-              // operator will be correctly handled and cached
-              auto result = evaluate(std::move(finalExpr), queryMetadata, true);
-              defaultCacheRegistry.clear();
 
+              // Phase 2: Batch split - split this pass's candidates by decision
+              std::vector<AdmissionCandidate> tier1, tier2;
+              for (auto &[name, entry] : defaultCacheRegistry) {
+                auto &viewEntry = viewRegistry.at(name);
+                auto decision = viewEntry.cachingDecision;
+                viewEntry.cachingDecision = CachingDecision::Defer; // reset for next query
+
+                if (decision == CachingDecision::Reject)
+                  continue; // discard rejected views
+
+                // Fallback benefit to 0.0 if it cannot be computed, which shouldn't happen, but
+                // stay defensive
+                auto b = benefit(name, /*fallbackToIso=*/true).value_or(0.0);
+
+                AdmissionCandidate candidate{name, viewEntry.size, b};
+                (decision == CachingDecision::Admit ? tier1 : tier2)
+                    .push_back(std::move(candidate));
+              }
+
+              // Presently cached views compete with Defer candidates for eviction
+              for (auto const &[cachedName, value] : viewCache) {
+                if (defaultCacheRegistry.count(cachedName))
+                  continue; // skip views that have already been processed in this pass
+
+                // Same fallback as above
+                auto b = benefit(cachedName, /*fallbackToIso=*/true).value_or(0.0);
+                tier2.push_back({cachedName, viewRegistry.at(cachedName).size, b});
+              }
+
+              // Sort tier1 and tier2 by benefit, descending
+              auto benefitComparator = [](AdmissionCandidate const &a,
+                                          AdmissionCandidate const &b) {
+                return a.benefit > b.benefit;
+              };
+              std::sort(tier1.begin(), tier1.end(), benefitComparator);
+              std::sort(tier2.begin(), tier2.end(), benefitComparator);
+
+              std::unordered_set<boss::Symbol> finalSet;
+              double usedSize = 0.0;
+
+              auto buildCacheFrom = [&](std::vector<AdmissionCandidate> const &candidates) {
+                for (auto const &candidate : candidates) {
+                  if (usedSize + candidate.size > viewCacheSize)
+                    continue; // skip and try potentially smaller candidates with lower benefit
+                  finalSet.insert(candidate.name);
+                  usedSize += candidate.size;
+                }
+              };
+              buildCacheFrom(tier1); // admit all user-admitted views first
+              buildCacheFrom(tier2); // then admit as many Defer views as possible
+
+              // Phase 3: Evict all views not in the final set, and admit new views that made it
+              for (auto it = viewCache.begin(); it != viewCache.end();) {
+                if (!finalSet.count(it->first)) {
+                  viewCacheOccupancy -= viewRegistry.at(it->first).size;
+                  it = viewCache.erase(it);
+                } else {
+                  ++it;
+                }
+              }
+              for (auto &[name, entry] : defaultCacheRegistry) {
+                if (finalSet.count(name)) {
+                  viewCache[name] = std::move(entry.value);
+                  viewCacheOccupancy += viewRegistry.at(name).size;
+                }
+              }
+
+              auto *finalCE = std::get_if<ComplexExpression>(&finalExpr);
+              Expression result = (finalCE && finalCE->getHead() == "CacheRef"_)
+                                      ? evaluate(std::move(finalExpr), queryMetadata, true)
+                                      : std::move(finalExpr);
+
+              defaultCacheRegistry.clear();
               return result;
             }
 
-            // Handle leftover CacheRef operators in the pipeline on second pass
+            // Handle leftover bare Pending CacheRef as the final expression of a WithCaches block
             if (head == "CacheRef"_) {
               if (dynamics.size() != 2)
                 throw std::runtime_error("CacheRef requires exactly 2 arguments");
@@ -286,48 +355,29 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               if (!name)
                 throw std::runtime_error("CacheRef first argument must be a symbol");
 
-              if (!std::get_if<Symbol>(&dynamics[1]))
+              auto *type = std::get_if<Symbol>(&dynamics[1]);
+              if (!type)
                 throw std::runtime_error("CacheRef second argument must be a symbol");
 
-              auto viewName = std::move(*name);
-              auto it = viewRegistry.find(viewName);
-              if (it == viewRegistry.end())
-                throw std::runtime_error("CacheRef could not be resolved, view not found: " +
-                                         viewName.getName());
+              if (*type != "Pending"_ && *type != "Borrowed"_)
+                throw std::runtime_error("CacheRef unknown type: " + type->getName());
 
-              if (!it->second.cached) {
-                auto regIt = defaultCacheRegistry.find(viewName);
-                if (regIt == defaultCacheRegistry.end())
-                  throw std::runtime_error(
-                      "CacheRef could not be resolved, entry not found in cache registry: " +
-                      viewName.getName());
+              auto const &viewName = *name;
 
-                storeIfPositive(it->second.computeCost, regIt->second.computeCost);
-                storeIfPositive(it->second.materialiseCost, regIt->second.materialiseCost);
-                storeIfPositive(it->second.reuseCost, regIt->second.reuseCost);
-                storeIfPositive(it->second.marginalComputeCost, regIt->second.marginalComputeCost);
-                it->second.size = computeSize(regIt->second.value);
-                std::cerr << "[VE2] " << viewName.getName() << " write-back (CacheRef fallback): "
-                          << "compute=" << it->second.computeCost
-                          << " materialise=" << it->second.materialiseCost
-                          << " reuse=" << it->second.reuseCost
-                          << " marginalCompute=" << it->second.marginalComputeCost
-                          << " size=" << it->second.size << "\n";
+              // If during the WithCaches block the view was admitted to the cache,
+              // return its cached value
+              if (auto cacheIt = viewCache.find(viewName); cacheIt != viewCache.end())
+                return cacheIt->second.clone(CloneReason::EVALUATE_CONST_EXPRESSION);
 
-                if (!it->second.admissionDecided) {
-                  // TODO: actual benefit cost analysis leading to a decision
-                  it->second.shouldCache = true;
-                  it->second.admissionDecided = true;
-                }
+              // Otherwise, return the value from the cache registry,
+              // where it should still be present
+              auto regIt = defaultCacheRegistry.find(viewName);
+              if (regIt == defaultCacheRegistry.end())
+                throw std::runtime_error(
+                    "CacheRef could not be resolved, entry not found in cache registry: " +
+                    viewName.getName());
 
-                if (regIt->second.type != CacheEntryType::Borrowed && !it->second.shouldCache)
-                  return evaluate(std::move(regIt->second.value), queryMetadata, true);
-
-                it->second.cached = evaluate(std::move(regIt->second.value), queryMetadata, true);
-              }
-
-              // Return cached value for final result
-              return it->second.cached->clone(CloneReason::EVALUATE_CONST_EXPRESSION);
+              return std::move(regIt->second.value);
             }
 
             if (head == "DropView"_) {
@@ -361,6 +411,8 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               for (const auto &dep : it->second.dependencies)
                 viewToViews[dep].erase(viewName);
 
+              viewCacheOccupancy -= it->second.size; // Remove old size from occupancy
+              viewCache.erase(viewName);             // Invalidate the cache for the view itself
               viewRegistry.erase(it);
               return Expression(true);
             }
@@ -380,6 +432,8 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               viewRegistry.clear();
               tableToViews.clear();
               viewToViews.clear();
+              viewCache.clear();
+              viewCacheOccupancy = 0.0;
               return Expression(true);
             }
 
@@ -510,6 +564,28 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               return listTables();
             }
 
+            if (head == "SetCacheBudget"_) {
+              if (!topLevel)
+                return Expression(false);
+
+              if (dynamics.size() != 1)
+                return Expression(false); // SetCacheBudget requires exactly 1 argument: bytes
+
+              double bytes;
+              if (auto *d = std::get_if<double>(&dynamics[0]))
+                bytes = *d;
+              else if (auto *i = std::get_if<int64_t>(&dynamics[0]))
+                bytes = static_cast<double>(*i);
+              else
+                return Expression(false);
+
+              if (bytes <= 0.0)
+                return Expression(false);
+
+              viewCacheSize = bytes;
+              return Expression(true);
+            }
+
             // Recursively evaluate arguments of other expressions
             // Do not eval args to preserve definitions for output
             // Check is here to block eval on second pass through ViewEngine in pipeline
@@ -529,10 +605,9 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               queryViewArgs.emplace_back(std::move(s));
 
               if (!flatten) {
-                auto decision = resolveAdaptiveCaching(viewIt->second);
-                queryViewArgs.emplace_back(decision.shouldCache);
-                queryViewArgs.emplace_back(decision.forcedStrategy ==
-                                                   ExecutionStrategy::IsolatedMeasurement
+                auto strategy = selectExecutionStrategy(viewIt->second);
+                queryViewArgs.emplace_back("Defer"_);
+                queryViewArgs.emplace_back(strategy == ExecutionStrategy::IsolatedMeasurement
                                                ? Symbol("IsolatedMeasurement")
                                                : Symbol("Standard"));
               }

@@ -1,12 +1,11 @@
 #pragma once
 
 #include "QueryRewriter.hpp"
-#include <optional>
+#include "CachingProtocol.hpp"
 #include <unordered_map>
 #include <unordered_set>
 
 struct ViewEntry {
-  std::optional<Expression> cached;
   Expression definition;
   std::unordered_set<boss::Symbol> dependencies;
   Signature signature;
@@ -22,10 +21,7 @@ struct ViewEntry {
   double importanceFactor = 0.0;        // Used to rank views for eviction from cache
   uint64_t importanceLastAgedQuery = 0; // Last query when importance was aged
 
-  bool shouldCache = false; // Whether the view should be cached based on its cost-benefit analysis
-                            // or is marked for caching directly by the user
-  bool admissionDecided = false; // Whether the caching decision is made in VE1 or is deferred to
-                                 // VE2 for a more informed decision
+  CachingDecision cachingDecision = CachingDecision::Defer; // Whether the view should be cached
 };
 
 extern std::unordered_map<boss::Symbol, ViewEntry> viewRegistry; // In memory register of Views
@@ -58,7 +54,3 @@ void invalidateDependentCaches(const boss::Symbol &invalidatedView,
 
 // Checks if the new value is > 0.0 and updates the target field if so
 void storeIfPositive(double &target, const double newValue);
-
-// Compute the size of a view after evaluating it.
-// The result must be a table expression, otherwise an exception is thrown.
-double computeSize(Expression const &tableExpr);

@@ -1,4 +1,5 @@
 #include "QueryRewriter.hpp"
+#include "Cache.hpp"
 #include "MetadataRegistry.hpp"
 #include "ViewRegistry.hpp"
 #include <Expression.hpp>
@@ -1318,8 +1319,8 @@ std::optional<Expression> findRewriting(const Expression &query, ViewMetadata &q
       entry.importanceFactor += score;
     }
 
-    if (score >= 1.0 && entry.cached) {
-      boss::ExpressionArguments args; 
+    if (score >= 1.0 && viewCache.count(name)) {
+      boss::ExpressionArguments args;
       args.push_back(Symbol(name));
       Expression queryView = ComplexExpression("QueryView"_, {}, std::move(args), {});
       return queryView;
