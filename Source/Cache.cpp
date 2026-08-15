@@ -179,58 +179,6 @@ std::optional<double> benefit(boss::Symbol const &name, bool fallbackToIso) {
   return savings * entry.importanceFactor / entry.size;
 }
 
-namespace {
-
-struct EvictionPlan {
-  std::vector<boss::Symbol> names;
-  double totalSize = 0.0;
-  double avgBenefit = 0.0; // size-weighted mean benefit of the selected set
-};
-
-// Selects (without evicting) the lowest-benefit entries from viewCache needed to free at
-// least `bytesToFree` bytes, or as many as are available if the cache can't cover it.
-EvictionPlan selectForEviction(double bytesToFree) {
-  struct Candidate {
-    boss::Symbol name;
-    double size;
-    double benefit;
-  };
-  std::vector<Candidate> candidates;
-  candidates.reserve(viewCache.size());
-
-  for (auto const &[cachedName, value] : viewCache) {
-    auto b = benefit(cachedName, /*fallbackToIso=*/true);
-    if (!b)
-      continue; // shouldn't happen for a cached entry, but stay defensive
-    candidates.push_back({cachedName, viewRegistry.at(cachedName).size, *b});
-  }
-
-  std::sort(candidates.begin(), candidates.end(),
-            [](auto const &a, auto const &b) { return a.benefit < b.benefit; });
-
-  EvictionPlan plan;
-  double accWeighted = 0.0;
-  for (auto const &c : candidates) {
-    if (plan.totalSize >= bytesToFree)
-      break;
-    plan.names.push_back(c.name);
-    plan.totalSize += c.size;
-    accWeighted += c.benefit * c.size;
-  }
-  plan.avgBenefit = plan.totalSize > 0.0 ? accWeighted / plan.totalSize : 0.0;
-  return plan;
-}
-
-// Commits a previously selected eviction plan.
-void applyEviction(EvictionPlan const &plan) {
-  for (auto const &name : plan.names) {
-    viewCacheOccupancy -= viewRegistry.at(name).size;
-    viewCache.erase(name);
-  }
-}
-
-} // namespace
-
 ExecutionStrategy selectExecutionStrategy(ViewEntry &entry) {
   auto iso = isoCost(entry);
   if (!iso) {
@@ -250,39 +198,4 @@ ExecutionStrategy selectExecutionStrategy(ViewEntry &entry) {
       *iso < *std_ ? ExecutionStrategy::IsolatedMeasurement : ExecutionStrategy::Standard;
 
   return strategy;
-}
-
-bool tryAdmit(Symbol const &name) {
-  if (viewCacheOccupancy > viewCacheSize) {
-    auto plan = selectForEviction(viewCacheOccupancy - viewCacheSize);
-    applyEviction(plan); // enforce budget if changed by SetCacheBudget to a smaller value
-  }
-
-  auto it = viewRegistry.find(name);
-  if (it == viewRegistry.end())
-    return false; // Shouldn't happen in practice
-
-  auto const &entry = it->second;
-
-  if (viewCacheOccupancy + entry.size <= viewCacheSize)
-    return true; // Fits without eviction
-  if (entry.size > viewCacheSize)
-    return false; // can never fit, even with the cache fully emptied
-
-  auto candidateBenefit = benefit(name, true);
-  if (!candidateBenefit || *candidateBenefit <= 0.0)
-    return false; // Shouldn't happen but guard to be safe
-
-  double bytesNeeded = (viewCacheOccupancy + entry.size) - viewCacheSize;
-  auto plan = selectForEviction(bytesNeeded);
-
-  // Check in the case we couldn't calculate the benefit score of every cached view
-  if (plan.totalSize < bytesNeeded)
-    return false; // not enough evictable space even if we took everything
-
-  if (plan.avgBenefit >= *candidateBenefit)
-    return false; // Evicting the least beneficial views would be worse than keeping them
-
-  applyEviction(plan);
-  return true;
 }

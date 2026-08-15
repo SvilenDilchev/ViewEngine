@@ -35,7 +35,3 @@ std::optional<double> benefit(boss::Symbol const &name, bool fallbackToIso = fal
 
 // Depending on cost analysis it decides the execution strategy of the view
 ExecutionStrategy selectExecutionStrategy(ViewEntry &entry);
-
-// Checks if a view can be admitted into the cache. Returns whether it was successful.
-// The attempt will evict other views if necessary to make room for the new view.
-bool tryAdmit(Symbol const &name, bool ignoreBenefit = false);
