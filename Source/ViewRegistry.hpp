@@ -21,6 +21,11 @@ struct ViewEntry {
 
   double importanceFactor = 0.0;        // Used to rank views for eviction from cache
   uint64_t importanceLastAgedQuery = 0; // Last query when importance was aged
+
+  bool shouldCache = false; // Whether the view should be cached based on its cost-benefit analysis
+                            // or is marked for caching directly by the user
+  bool admissionDecided = false; // Whether the caching decision is made in VE1 or is deferred to
+                                 // VE2 for a more informed decision
 };
 
 extern std::unordered_map<boss::Symbol, ViewEntry> viewRegistry; // In memory register of Views

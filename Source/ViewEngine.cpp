@@ -1,3 +1,4 @@
+#include "AdmissionPolicy.hpp"
 #include "CachingProtocol.hpp"
 #include "MetadataRegistry.hpp"
 #include "ViewRegistry.hpp"
@@ -101,8 +102,8 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
             }
 
             if (head == "QueryView"_) {
-              if (dynamics.size() < 1 || dynamics.size() > 3)
-                throw std::runtime_error("QueryView requires 1 to 3 arguments");
+              if (dynamics.size() < 1 || dynamics.size() > 4)
+                throw std::runtime_error("QueryView requires 1 to 4 arguments");
 
               auto *name = std::get_if<Symbol>(&dynamics[0]);
               if (!name)
@@ -116,17 +117,24 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 shouldCache = *flag;
               }
 
-              std::optional<IntegrityCheckMode> integrityMode = std::nullopt;
-              if (dynamics.size() == 3) {
-                auto *mode = std::get_if<Symbol>(&dynamics[2]);
-                if (!mode)
+              std::optional<ExecutionStrategy> forcedStrategy = std::nullopt;
+              if (dynamics.size() >= 3) {
+                auto *strat = std::get_if<Symbol>(&dynamics[2]);
+                if (!strat)
                   throw std::runtime_error("QueryView third argument must be a symbol");
+                forcedStrategy = symbolToExecutionStrategy(*strat);
+                if (!forcedStrategy)
+                  throw std::runtime_error("QueryView unknown execution strategy: " +
+                                           strat->getName());
+              }
 
-                if (*mode == "Structural"_)
-                  integrityMode = IntegrityCheckMode::Structural;
-                else if (*mode == "Content"_)
-                  integrityMode = IntegrityCheckMode::Content;
-                else
+              std::optional<IntegrityCheckMode> integrityMode = std::nullopt;
+              if (dynamics.size() == 4) {
+                auto *mode = std::get_if<Symbol>(&dynamics[3]);
+                if (!mode)
+                  throw std::runtime_error("QueryView fourth argument must be a symbol");
+                integrityMode = symbolToIntegrityCheckMode(*mode);
+                if (!integrityMode)
                   throw std::runtime_error("QueryView unknown integrity mode: " + mode->getName());
               }
 
@@ -143,6 +151,11 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               std::cerr << "[VE1-diag] QueryView(" << viewName.getName()
                         << ") entry.cached.has_value()=" << entry.cached.has_value() << "\n";
 
+              if (flatten) {
+                return evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
+                                queryMetadata, true, true);
+              }
+
               if (queryMetadata && queryMetadata->creditAwarded) {
                 queryMetadata->creditAwarded = false;
               } else if (queryMetadata && !queryMetadata->creditAwarded) {
@@ -151,13 +164,10 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 entry.importanceFactor += 1.0;
               }
 
-              if (flatten) {
-                return evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
-                                queryMetadata, true, true);
-              }
-
               // If cached before, avoid cloning by following borrowed cache protocol to move out
               // and move back in at the second pass of ViewEngine in the pipelines
+              // TODO: allow the user to explicitly prefer recalculating the view instead of using
+              // the cached value
               if (entry.cached) {
                 boss::ExpressionArguments cacheRefArgs;
                 cacheRefArgs.emplace_back(viewName);
@@ -184,19 +194,15 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               auto result = evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
                                      queryMetadata, true);
 
-              if (!shouldCache)
-                return std::move(result); // Return without caching
-
-              // TODO: handle single view engine case - E.g., Cache the result evaluated only by
-              // ViewEngine because noone can consume the wrapper otherwise
-              // entry.cached = result.clone(CloneReason::EXPRESSION_WRAPPING);
+              // Mark the decision to cache for VE2 to handle
+              entry.shouldCache = shouldCache;
 
               // Check if already registered to avoid duplicates
               if (!defaultCacheRegistry.count(viewName)) {
                 ExecutionStrategy strategy =
-                    (entry.computeCost > 0.0 || entry.materialiseCost > 0.0)
-                        ? ExecutionStrategy::Standard
-                        : ExecutionStrategy::IsolatedMeasurement;
+                    forcedStrategy.value_or((entry.computeCost > 0.0 || entry.materialiseCost > 0.0)
+                                                ? ExecutionStrategy::Standard
+                                                : ExecutionStrategy::IsolatedMeasurement);
 
                 Expression entryValue =
                     strategy == ExecutionStrategy::IsolatedMeasurement
@@ -234,23 +240,30 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                   throw std::runtime_error("View not found for caching in WithCaches: " +
                                            name.getName());
 
-                storeIfPositive(it->second.computeCost, entry.computeCost);
-                storeIfPositive(it->second.materialiseCost, entry.materialiseCost);
-                storeIfPositive(it->second.reuseCost, entry.reuseCost);
-                storeIfPositive(it->second.marginalComputeCost, entry.marginalComputeCost);
-                std::cerr << "[VE2] " << name.getName() << " write-back (WithCaches loop): "
-                          << "compute=" << it->second.computeCost
-                          << " materialise=" << it->second.materialiseCost
-                          << " reuse=" << it->second.reuseCost
-                          << " marginalCompute=" << it->second.marginalComputeCost << " strategy="
-                          << (entry.executionStrategy == ExecutionStrategy::IsolatedMeasurement
-                                  ? "IsolatedMeasurement"
-                                  : "Standard")
-                          << "\n";
-
                 if (!it->second.cached) {
+                  storeIfPositive(it->second.computeCost, entry.computeCost);
+                  storeIfPositive(it->second.materialiseCost, entry.materialiseCost);
+                  storeIfPositive(it->second.reuseCost, entry.reuseCost);
+                  storeIfPositive(it->second.marginalComputeCost, entry.marginalComputeCost);
                   it->second.size = computeSize(entry.value);
-                  it->second.cached = evaluate(std::move(entry.value), queryMetadata, true);
+                  std::cerr << "[VE2] " << name.getName() << " write-back (WithCaches loop): "
+                            << "compute=" << it->second.computeCost
+                            << " materialise=" << it->second.materialiseCost
+                            << " reuse=" << it->second.reuseCost
+                            << " marginalCompute=" << it->second.marginalComputeCost << " strategy="
+                            << (entry.executionStrategy == ExecutionStrategy::IsolatedMeasurement
+                                    ? "IsolatedMeasurement"
+                                    : "Standard")
+                            << " size=" << it->second.size << "\n";
+
+                  if (!it->second.admissionDecided) {
+                    // TODO: actual benefit cost analysis leading to a decision
+                    it->second.shouldCache = true;
+                    it->second.admissionDecided = true;
+                  }
+
+                  if (entry.type == CacheEntryType::Borrowed || it->second.shouldCache)
+                    it->second.cached = evaluate(std::move(entry.value), queryMetadata, true);
                 }
 
                 std::cerr << "[VE2-diag] " << name.getName()
@@ -293,13 +306,23 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 storeIfPositive(it->second.materialiseCost, regIt->second.materialiseCost);
                 storeIfPositive(it->second.reuseCost, regIt->second.reuseCost);
                 storeIfPositive(it->second.marginalComputeCost, regIt->second.marginalComputeCost);
+                it->second.size = computeSize(regIt->second.value);
                 std::cerr << "[VE2] " << viewName.getName() << " write-back (CacheRef fallback): "
                           << "compute=" << it->second.computeCost
                           << " materialise=" << it->second.materialiseCost
                           << " reuse=" << it->second.reuseCost
-                          << " marginalCompute=" << it->second.marginalComputeCost << "\n";
+                          << " marginalCompute=" << it->second.marginalComputeCost
+                          << " size=" << it->second.size << "\n";
 
-                it->second.size = computeSize(regIt->second.value);
+                if (!it->second.admissionDecided) {
+                  // TODO: actual benefit cost analysis leading to a decision
+                  it->second.shouldCache = true;
+                  it->second.admissionDecided = true;
+                }
+
+                if (regIt->second.type != CacheEntryType::Borrowed && !it->second.shouldCache)
+                  return evaluate(std::move(regIt->second.value), queryMetadata, true);
+
                 it->second.cached = evaluate(std::move(regIt->second.value), queryMetadata, true);
               }
 
@@ -504,7 +527,16 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
             if (viewIt != viewRegistry.end()) {
               boss::ExpressionArguments queryViewArgs;
               queryViewArgs.emplace_back(std::move(s));
-              // TODO: implement adaptive caching
+
+              if (!flatten) {
+                auto decision = resolveAdaptiveCaching(viewIt->second);
+                queryViewArgs.emplace_back(decision.shouldCache);
+                queryViewArgs.emplace_back(decision.forcedStrategy ==
+                                                   ExecutionStrategy::IsolatedMeasurement
+                                               ? Symbol("IsolatedMeasurement")
+                                               : Symbol("Standard"));
+              }
+
               auto rewritten =
                   Expression(ComplexExpression("QueryView"_, {}, std::move(queryViewArgs), {}));
               return evaluate(std::move(rewritten), queryMetadata, true, flatten);

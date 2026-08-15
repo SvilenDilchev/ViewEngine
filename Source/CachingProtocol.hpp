@@ -94,6 +94,25 @@ using CacheRegistry = std::unordered_map<boss::Symbol, CacheEntry>;
 // Each engine compiled as a separate .so gets its own independent instance.
 inline CacheRegistry defaultCacheRegistry;
 
+// Helper functions to convert symbols to enums for integrity check mode and execution strategy
+inline std::optional<IntegrityCheckMode> symbolToIntegrityCheckMode(Symbol const &s) {
+  using boss::utilities::operator""_;
+  if (s == "Structural"_)
+    return IntegrityCheckMode::Structural;
+  if (s == "Content"_)
+    return IntegrityCheckMode::Content;
+  return std::nullopt;
+}
+
+inline std::optional<ExecutionStrategy> symbolToExecutionStrategy(Symbol const &s) {
+  using boss::utilities::operator""_;
+  if (s == "Standard"_)
+    return ExecutionStrategy::Standard;
+  if (s == "IsolatedMeasurement"_)
+    return ExecutionStrategy::IsolatedMeasurement;
+  return std::nullopt;
+}
+
 // Parses a WithCaches expression, populates registry with Borrowed
 // and Pending entries, and returns the actual query (last arg).
 inline Expression unpackWithCaches(Expression &&expr, CacheRegistry &registry) {
@@ -112,19 +131,16 @@ inline Expression unpackWithCaches(Expression &&expr, CacheRegistry &registry) {
 
     auto name = std::get<Symbol>(std::move(wDynamics[0]));
     auto value = std::move(wDynamics[1]);
-    auto executionStrategy = std::get<Symbol>(wDynamics[2]) == "IsolatedMeasurement"_
-                                 ? ExecutionStrategy::IsolatedMeasurement
-                                 : ExecutionStrategy::Standard;
+    auto executionStrategy = symbolToExecutionStrategy(std::get<Symbol>(wDynamics[2]))
+                                 .value_or(ExecutionStrategy::Standard);
     auto computeCost = std::get<double>(wDynamics[3]);
     auto materialiseCost = std::get<double>(wDynamics[4]);
     auto reuseCost = std::get<double>(wDynamics[5]);
     auto marginalComputeCost = std::get<double>(wDynamics[6]);
     std::optional<IntegrityCheckMode> mode = std::nullopt;
-    if (type == CacheEntryType::Borrowed && wDynamics.size() >= 8) {
-      auto const &modeSym = std::get<Symbol>(wDynamics[7]);
-      mode =
-          modeSym == "Structural"_ ? IntegrityCheckMode::Structural : IntegrityCheckMode::Content;
-    }
+    if (type == CacheEntryType::Borrowed && wDynamics.size() >= 8)
+      mode = symbolToIntegrityCheckMode(std::get<Symbol>(wDynamics[7]))
+                 .value_or(IntegrityCheckMode::Content);
 
     registry[std::move(name)] = CacheEntry{
         std::move(value),   type, mode, executionStrategy, computeCost, materialiseCost, reuseCost,
