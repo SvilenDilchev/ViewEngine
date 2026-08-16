@@ -118,7 +118,9 @@ std::optional<double> isoCost(ViewEntry const &entry) {
   return entry.computeCost + entry.materialiseCost;
 }
 
-std::optional<double> stdCost(ViewEntry const &entry, bool fallbackToIso) {
+std::optional<double> stdCost(ViewEntry const &entry,
+                              std::unordered_map<boss::Symbol, std::optional<double>> &memo,
+                              bool fallbackToIso) {
   if (!hasStdInfo(entry))
     return std::nullopt; // parent true cost will handle fallback to iso
 
@@ -135,7 +137,7 @@ std::optional<double> stdCost(ViewEntry const &entry, bool fallbackToIso) {
       // handle the case where the reuse cost is unknown.
       total += depEntry.reuseCost;
     } else {
-      auto depCost = trueCost(dep, fallbackToIso);
+      auto depCost = trueCost(dep, memo, fallbackToIso);
       if (!depCost)
         return std::nullopt; // Missing info anywhere down the chain, shouldn't happen if
                              // fallbackToIso is true, but we don't want to crash if it does.
@@ -146,23 +148,36 @@ std::optional<double> stdCost(ViewEntry const &entry, bool fallbackToIso) {
   return total;
 }
 
-std::optional<double> trueCost(boss::Symbol const &name, bool fallbackToIso) {
+std::optional<double> trueCost(boss::Symbol const &name,
+                               std::unordered_map<boss::Symbol, std::optional<double>> &memo,
+                               bool fallbackToIso) {
+  if (auto it = memo.find(name); it != memo.end())
+    return it->second;
+
   auto it = viewRegistry.find(name);
   if (it == viewRegistry.end())
     return std::nullopt; // Shouldn't happen in practice
 
   auto const &entry = it->second;
   auto iso = isoCost(entry);
-  auto std_ = stdCost(entry, fallbackToIso);
+  auto std_ = stdCost(entry, memo, fallbackToIso);
 
+  std::optional<double> result;
   if (iso && std_)
-    return std::min(*iso, *std_);
-  if (iso && fallbackToIso)
-    return iso;
-  return std_;
+    result = std::min(*iso, *std_);
+  else if (iso && fallbackToIso)
+    result = iso;
+  else
+    result = std_;
+
+  memo[name] = result;
+
+  return result;
 }
 
-std::optional<double> benefit(boss::Symbol const &name, bool fallbackToIso) {
+std::optional<double> benefit(boss::Symbol const &name,
+                              std::unordered_map<boss::Symbol, std::optional<double>> &memo,
+                              bool fallbackToIso) {
   auto it = viewRegistry.find(name);
   if (it == viewRegistry.end())
     return std::nullopt; // Shouldn't happen in practice
@@ -171,7 +186,7 @@ std::optional<double> benefit(boss::Symbol const &name, bool fallbackToIso) {
   if (entry.size <= 0.0)
     return std::nullopt;
 
-  auto cost = trueCost(name, fallbackToIso);
+  auto cost = trueCost(name, memo, fallbackToIso);
   if (!cost)
     return std::nullopt;
 
@@ -179,7 +194,9 @@ std::optional<double> benefit(boss::Symbol const &name, bool fallbackToIso) {
   return savings * entry.importanceFactor / entry.size;
 }
 
-ExecutionStrategy selectExecutionStrategy(ViewEntry &entry) {
+ExecutionStrategy
+selectExecutionStrategy(ViewEntry &entry,
+                        std::unordered_map<boss::Symbol, std::optional<double>> &memo) {
   auto iso = isoCost(entry);
   if (!iso) {
     // Run isolated measurement to get instrumentation info and defer the caching decision to VE2
@@ -187,7 +204,8 @@ ExecutionStrategy selectExecutionStrategy(ViewEntry &entry) {
     return ExecutionStrategy::IsolatedMeasurement;
   }
 
-  auto std_ = stdCost(entry);
+  // Memoise true cost computations for this pass to avoid redundant calculations
+  auto std_ = stdCost(entry, memo);
   if (!std_) {
     // Run standard execution to get instrumentation info and defer the caching decision to VE2
     // where we have more information.

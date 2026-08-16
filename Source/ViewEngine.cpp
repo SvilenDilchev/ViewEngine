@@ -281,8 +281,8 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                   continue; // discard rejected views
 
                 // Fallback benefit to 0.0 if it cannot be computed, which shouldn't happen, but
-                // stay defensive
-                auto b = benefit(name, /*fallbackToIso=*/true).value_or(0.0);
+                // stay defensive, and use the true cost memo to avoid redundant computations
+                auto b = benefit(name, queryMetadata->trueCostMemo, true).value_or(0.0);
 
                 AdmissionCandidate candidate{name, viewEntry.size, b};
                 (decision == CachingDecision::Admit ? tier1 : tier2)
@@ -294,8 +294,8 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 if (defaultCacheRegistry.count(cachedName))
                   continue; // skip views that have already been processed in this pass
 
-                // Same fallback as above
-                auto b = benefit(cachedName, /*fallbackToIso=*/true).value_or(0.0);
+                // Same as above
+                auto b = benefit(cachedName, queryMetadata->trueCostMemo, true).value_or(0.0);
                 tier2.push_back({cachedName, viewRegistry.at(cachedName).size, b});
               }
 
@@ -605,7 +605,8 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               queryViewArgs.emplace_back(std::move(s));
 
               if (!flatten) {
-                auto strategy = selectExecutionStrategy(viewIt->second);
+                auto strategy =
+                    selectExecutionStrategy(viewIt->second, queryMetadata->trueCostMemo);
                 queryViewArgs.emplace_back("Defer"_);
                 queryViewArgs.emplace_back(strategy == ExecutionStrategy::IsolatedMeasurement
                                                ? Symbol("IsolatedMeasurement")
