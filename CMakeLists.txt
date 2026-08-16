@@ -73,6 +73,7 @@ add_library(ViewEngine ${LibraryType}
   Source/ViewRegistry.cpp
   Source/QueryRewriter.cpp
   Source/MetadataRegistry.cpp
+  Source/Cache.cpp
 )
 
 set_property(TARGET ViewEngine PROPERTY CXX_STANDARD 23)
