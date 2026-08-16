@@ -76,7 +76,7 @@ double sizeOfColumn(boss::ExpressionArguments const &dynamics) {
 double computeSize(Expression const &tableExpr) {
   auto const *ce = std::get_if<ComplexExpression>(&tableExpr);
   if (!ce || ce->getHead() != "Table"_)
-    throw std::runtime_error("computeSize: Expression is not a Table");
+    return 0.0; // Not a table expression, size is 0, cannot be admitted to the cache
 
   double total = 0.0;
 

@@ -3,6 +3,7 @@
 
 std::unordered_map<boss::Symbol, ViewEntry> viewRegistry;
 std::unordered_set<boss::Symbol> evaluationStack;
+std::unordered_set<boss::Symbol> resolvedCacheRefs;
 std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> tableToViews;
 std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> viewToViews;
 uint64_t veTick = 0;

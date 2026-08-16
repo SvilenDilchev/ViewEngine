@@ -10,8 +10,9 @@
 using boss::expressions::CloneReason;
 using boss::utilities::operator""_;
 
-static const std::unordered_set<boss::Symbol> sideEffectOperators = {"DefineView"_, "DropView"_,
-                                                                     "ClearViews"_};
+static const std::unordered_set<boss::Symbol> sideEffectOperators = {
+    "DefineView"_, "DropView"_,    "ClearViews"_,    "RegisterTable"_,
+    "DropTable"_,  "ClearTables"_, "SetCacheBudget"_};
 
 static const std::unordered_set<boss::Symbol> rewritableOperators = {
     "Filter"_, "Join"_, "LeftJoin"_, "AntiJoin"_, "Project"_};

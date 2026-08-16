@@ -280,6 +280,10 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 if (decision == CachingDecision::Reject)
                   continue; // discard rejected views
 
+                if (viewEntry.size <= 0.0)
+                  continue; // never materialised as Table_ (still symbolic);
+                            // don't admit unknown size views
+
                 // Fallback benefit to 0.0 if it cannot be computed, which shouldn't happen, but
                 // stay defensive, and use the true cost memo to avoid redundant computations
                 auto b = benefit(name, queryMetadata->trueCostMemo, true).value_or(0.0);
@@ -337,8 +341,10 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 }
               }
 
+              // If final expression is a materialised Table, return the result, otherwise run it
+              // through evaluation for unevaluated CacheRefs; shouldn't happen in practice
               auto *finalCE = std::get_if<ComplexExpression>(&finalExpr);
-              Expression result = (finalCE && finalCE->getHead() == "CacheRef"_)
+              Expression result = (finalCE && finalCE->getHead() != "Table"_)
                                       ? evaluate(std::move(finalExpr), queryMetadata, true)
                                       : std::move(finalExpr);
 
@@ -376,6 +382,19 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 throw std::runtime_error(
                     "CacheRef could not be resolved, entry not found in cache registry: " +
                     viewName.getName());
+
+              if (resolvedCacheRefs.count(viewName))
+                // ACE should resolve all cache references. The only exception is a single bare
+                // Pending CacheRef as the final expression of the WithCaches wrapper. This guard is
+                // here if either a computational engines (like ACE) is not used and consequently
+                // multiple CacheRefs are not resolved. This block only allows for one CacheRef to a
+                // view to be resolved due to the move, which is correct behaviour, but if something
+                // goes wrong we want to catch it and throw instead of silently have something go
+                // wrong. In practice this should never fire.
+                throw std::runtime_error(
+                    "CacheRef for " + viewName.getName() +
+                    " referenced more than once in a single pass without an intervening "
+                    "materialising engine");
 
               return std::move(regIt->second.value);
             }
@@ -653,6 +672,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
 
 extern "C" BOSSExpression *evaluate(BOSSExpression *e) {
   defaultCacheRegistry.clear();
+  resolvedCacheRefs.clear();
   ++veTick;
   auto result = evaluate(std::move(e->delegate), nullptr, false, false, true);
 

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "QueryRewriter.hpp"
 #include "CachingProtocol.hpp"
+#include "QueryRewriter.hpp"
 #include <unordered_map>
 #include <unordered_set>
 
@@ -26,6 +26,8 @@ struct ViewEntry {
 
 extern std::unordered_map<boss::Symbol, ViewEntry> viewRegistry; // In memory register of Views
 extern std::unordered_set<boss::Symbol> evaluationStack;         // Guard against runtime cycles
+extern std::unordered_set<boss::Symbol>
+    resolvedCacheRefs; // Guard against repeated unevaluated CacheRefs in WithCaches evaluation
 
 // Indexes for efficient candidate view lookup during rewriting
 // Table name -> set of view names that directly touch that table
