@@ -36,6 +36,14 @@ struct Interval {
   bool upperInclusive = true;
 };
 
+// TODO(far future): a ColumnDomain only ever represents a single conjunctive clause for one
+// column, so an Or spanning multiple columns (e.g. Or(Equal(a, 1), Equal(b, 2))) can't be
+// represented as domains at all and falls back to an opaque predicate string with no coverage
+// reasoning (see the `unionisable` check in the Or handling in QueryRewriter.cpp). Explore
+// representing a Signature's predicates in Disjunctive Normal Form (DNF) instead - i.e. a list of
+// conjunctive clauses (each one a set of independent per-column domains/predicates) OR'd
+// together - so cross-column disjunctions can still be scored and matched instead of opaquely
+// rejected.
 struct ColumnDomain {
   std::vector<Interval> ranges; // sorted by lower bound, non-overlapping
   bool unrepresentable = false; // if there is a type clash while merging predicates, tell the

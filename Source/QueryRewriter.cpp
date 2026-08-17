@@ -29,16 +29,46 @@ static const std::unordered_set<boss::Symbol> domainPredicateOperators = {
 static const std::unordered_map<boss::Symbol, JoinType> joinTypeMap = {
     {"Join"_, JoinType::INNER}, {"LeftJoin"_, JoinType::LEFT}, {"AntiJoin"_, JoinType::ANTI}};
 
-// TODO: canonicalise serialised predicates (e.g., Equal(a, b) vs Equal(b, a))
-static std::string serializeExpr(const Expression &expr) {
+// Operators whose operands can be reordered without changing meaning, so their serialised
+// argument list is sorted to give equivalent predicates (e.g., Equal(a, b) vs Equal(b, a), or
+// Or(P1, P2) vs Or(P2, P1)) the same canonical key
+static const std::unordered_set<boss::Symbol> commutativePredicateOperators = {
+    "Equal"_, "NotEqual"_, "And"_, "Or"_};
+
+// Comparison operators whose operands can be swapped if the operator is flipped to its
+// converse (e.g., Greater(a, b) means the same thing as Less(b, a))
+static const std::unordered_map<boss::Symbol, boss::Symbol> conversePredicateOperators = {
+    {"Greater"_, "Less"_},
+    {"Less"_, "Greater"_},
+    {"GreaterEqual"_, "LessEqual"_},
+    {"LessEqual"_, "GreaterEqual"_}};
+
+static std::string serialiseExpr(const Expression &expr) {
   return std::visit(boss::utilities::overload(
                         [](const ComplexExpression &ce) {
-                          std::string result = ce.getHead().getName() + "(";
+                          std::vector<std::string> argStrs;
+                          argStrs.reserve(ce.getDynamicArguments().size());
+                          for (const auto &arg : ce.getDynamicArguments())
+                            argStrs.push_back(serialiseExpr(arg));
+
+                          std::string headName = ce.getHead().getName();
+
+                          if (commutativePredicateOperators.count(ce.getHead())) {
+                            std::sort(argStrs.begin(), argStrs.end());
+                          } else if (argStrs.size() == 2) {
+                            if (auto it = conversePredicateOperators.find(ce.getHead());
+                                it != conversePredicateOperators.end() && argStrs[1] < argStrs[0]) {
+                              std::swap(argStrs[0], argStrs[1]);
+                              headName = it->second.getName();
+                            }
+                          }
+
+                          std::string result = headName + "(";
                           bool first = true;
-                          for (const auto &arg : ce.getDynamicArguments()) {
+                          for (auto &argStr : argStrs) {
                             if (!first)
                               result += ",";
-                            result += serializeExpr(arg);
+                            result += argStr;
                             first = false;
                           }
                           return result + ")";
@@ -185,7 +215,7 @@ void ViewMetadata::intersectMerge(ViewMetadata &&other) {
   for (auto &[col, expr] : other.signature.projectedColumns) {
     auto it = signature.projectedColumns.find(col);
     if (it != signature.projectedColumns.end()) {
-      if (serializeExpr(*it->second) != serializeExpr(*expr)) {
+      if (serialiseExpr(*it->second) != serialiseExpr(*expr)) {
         // Conflicting projections on the same column from different join branches
         sideEffect = true;
         return;
@@ -505,11 +535,11 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
               }
 
               std::sort(keyPairs.begin(), keyPairs.end(), [](const auto &a, const auto &b) {
-                auto aFirst = serializeExpr(a.first);
-                auto bFirst = serializeExpr(b.first);
+                auto aFirst = serialiseExpr(a.first);
+                auto bFirst = serialiseExpr(b.first);
                 if (aFirst != bFirst)
                   return aFirst < bFirst;
-                return serializeExpr(a.second) < serializeExpr(b.second);
+                return serialiseExpr(a.second) < serialiseExpr(b.second);
               });
 
               boss::ExpressionArguments leftKeysArgs, rightKeysArgs;
@@ -568,7 +598,9 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
                 metadata.dependencies.merge(branch.dependencies);
                 metadata.signature.baseTables.merge(branch.signature.baseTables);
 
-                // Check if the or can be unionised for must be handled as an opaque predicate
+                // Check if the or can be unionised for must be handled as an opaque predicate.
+                // Branches touching different columns can never be unionised into one
+                // ColumnDomain - see the DNF TODO on ColumnDomain in QueryRewriter.hpp.
                 if (!branch.signature.columnPredicates.empty() ||
                     branch.signature.columnDomains.size() != 1)
                   unionisable = false;
@@ -690,7 +722,7 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
                 // Fallback to opaque predicate handling for the whole Or expression
                 auto shared =
                     std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
-                auto key = serializeExpr(*shared);
+                auto key = serialiseExpr(*shared);
 
                 std::unordered_set<Symbol> refCols;
                 extractColumnsFromExpr(*shared, refCols);
@@ -766,7 +798,7 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
 
                 auto shared =
                     std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
-                auto key = serializeExpr(*shared);
+                auto key = serialiseExpr(*shared);
 
                 metadata.signature.columnPredicates[colSym0].emplace(key, shared);
                 metadata.signature.columnPredicates[colSym1].emplace(std::move(key),
@@ -811,7 +843,7 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
 
               auto shared =
                   std::make_shared<Expression>(ce.clone(CloneReason::EXPRESSION_WRAPPING));
-              auto key = serializeExpr(*shared);
+              auto key = serialiseExpr(*shared);
 
               metadata.signature.columnPredicates[colSym].emplace(std::move(key),
                                                                   std::move(shared));
@@ -1056,8 +1088,8 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
   // predicates
   std::unordered_set<size_t> matchedQueryJoinIndices;
   for (const auto &viewEdge : viewParts.joinEdges) {
-    auto viewLeftKey = serializeExpr(*viewEdge.leftKeys);
-    auto viewRightKey = serializeExpr(*viewEdge.rightKeys);
+    auto viewLeftKey = serialiseExpr(*viewEdge.leftKeys);
+    auto viewRightKey = serialiseExpr(*viewEdge.rightKeys);
     bool matched = false;
     for (size_t i = 0; i < queryParts.joinEdges.size(); ++i) {
       const auto &queryEdge = queryParts.joinEdges[i];
@@ -1067,8 +1099,8 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
       if (viewEdge.joinType == queryEdge.joinType &&
           viewEdge.leftSources == queryEdge.leftSources &&
           viewEdge.rightSources == queryEdge.rightSources &&
-          viewLeftKey == serializeExpr(*queryEdge.leftKeys) &&
-          viewRightKey == serializeExpr(*queryEdge.rightKeys)) {
+          viewLeftKey == serialiseExpr(*queryEdge.leftKeys) &&
+          viewRightKey == serialiseExpr(*queryEdge.rightKeys)) {
         matchedQueryJoinIndices.insert(i);
         matched = true;
         break;
@@ -1093,7 +1125,7 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
         // match)
         return -1.0;
       }
-      if (it->second && queryExpr && serializeExpr(*it->second) != serializeExpr(*queryExpr))
+      if (it->second && queryExpr && serialiseExpr(*it->second) != serialiseExpr(*queryExpr))
         return -1.0;
     }
     // Score is how many more columns the view projects on top of what the query needs,
@@ -1235,7 +1267,7 @@ std::optional<Expression> computeResidualFilter(const Signature &viewParts,
 
     if (coverage != DomainCoverage::EQUAL) {
       if (auto expr = domainToExpression(col, queryDomain))
-        missing.emplace(serializeExpr(*expr), std::make_shared<Expression>(std::move(*expr)));
+        missing.emplace(serialiseExpr(*expr), std::make_shared<Expression>(std::move(*expr)));
     }
   }
 
