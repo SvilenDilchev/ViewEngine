@@ -75,7 +75,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               }
 
               std::unordered_set<boss::Symbol> seen;
-              invalidateDependentCaches(viewName, seen);
+              invalidateDependants(viewName, seen);
 
               // Remove old index entries if view already exists
               if (auto existing = viewRegistry.find(viewName); existing != viewRegistry.end()) {

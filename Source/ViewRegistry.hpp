@@ -50,9 +50,10 @@ void ageEntry(ViewEntry &entry);
 // DFS walk to detect cycles in the dependency graph
 bool hasCycle(const boss::Symbol &newView, const boss::Symbol &current,
               std::unordered_set<boss::Symbol> &visited);
-// Invalidate caches of all views that directly or indirectly depend on the given view
-void invalidateDependentCaches(const boss::Symbol &invalidatedView,
-                               std::unordered_set<boss::Symbol> &seen);
+// Invalidate the cache and stale instrumentation of all views that directly or indirectly
+// depend on the given view
+void invalidateDependants(const boss::Symbol &invalidatedView,
+                          std::unordered_set<boss::Symbol> &seen);
 
 // Checks if the new value is > 0.0 and updates the target field if so
 void storeIfPositive(double &target, const double newValue);

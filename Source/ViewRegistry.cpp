@@ -39,23 +39,29 @@ bool hasCycle(const boss::Symbol &newView, const boss::Symbol &current,
   return false;
 }
 
-void invalidateDependentCaches(const boss::Symbol &invalidatedView,
-                               std::unordered_set<boss::Symbol> &seen) {
+void invalidateDependants(const boss::Symbol &invalidatedView,
+                          std::unordered_set<boss::Symbol> &seen) {
   auto it = viewToViews.find(invalidatedView);
   if (it == viewToViews.end())
     return;
 
-  for (const auto &dependent : it->second) {
-    if (seen.count(dependent))
+  for (const auto &dependant : it->second) {
+    if (seen.count(dependant))
       continue;
-    seen.insert(dependent);
-    auto vit = viewRegistry.find(dependent);
+    seen.insert(dependant);
+    auto vit = viewRegistry.find(dependant);
     if (vit != viewRegistry.end()) {
-      // TODO: invalidate instrumentation data as well
       viewCacheOccupancy -= vit->second.size;
-      viewCache.erase(dependent); // Invalidate the cache for the dependent view
+      viewCache.erase(dependant); // Invalidate the cache for the dependant view
+
+      // Invalidate the stale cost and size metrics for the dependant view as well
+      vit->second.computeCost = 0.0;
+      vit->second.materialiseCost = 0.0;
+      vit->second.reuseCost = 0.0;
+      vit->second.marginalComputeCost = 0.0;
+      vit->second.size = 0.0;
     }
-    invalidateDependentCaches(dependent, seen);
+    invalidateDependants(dependant, seen);
   }
 }
 
