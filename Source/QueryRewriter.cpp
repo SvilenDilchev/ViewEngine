@@ -1269,22 +1269,23 @@ std::optional<boss::ExpressionArguments> computeResidualProjection(const Signatu
   }
 
   if (!viewParts.projectedColumns.empty() && queryParts.projectedColumns.empty()) {
-    std::unordered_set<boss::Symbol> queryColumns;
+    std::unordered_set<boss::Symbol> seenColumns;
+    std::vector<boss::Symbol> orderedColumns;
     for (const auto &table : queryParts.baseTables) {
       const auto &entry = tableRegistry.find(table);
       if (entry == tableRegistry.end())
         return std::nullopt; // Shouldn't happen, but still bail safely
       for (const auto &col : entry->second.columns)
-        queryColumns.insert(col);
+        if (seenColumns.insert(col).second)
+          orderedColumns.push_back(col);
     }
 
-    if (queryColumns.size() == viewParts.projectedColumns.size())
-      return std::nullopt; // View projects exactly the base columns, no residual projection
-                           // needed
+    if (orderedColumns.size() == viewParts.projectedColumns.size())
+      return std::nullopt; // View projects exactly the base columns,
+                           // no residual projection needed
 
     boss::ExpressionArguments residualArgs;
-    // TODO: Looping a set loses the ordering of columns that should probably exist
-    for (const auto &col : queryColumns)
+    for (const auto &col : orderedColumns)
       residualArgs.push_back(Symbol(col));
 
     return std::move(residualArgs);
