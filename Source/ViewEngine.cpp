@@ -3,6 +3,7 @@
 #include "MetadataRegistry.hpp"
 #include "ViewRegistry.hpp"
 
+#include <chrono>
 #include <iostream>
 #include <unordered_set>
 #include <utility>
@@ -123,8 +124,6 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                                          viewName.getName());
 
               ViewEntry &entry = it->second;
-              std::cerr << "[VE1-diag] QueryView(" << viewName.getName()
-                        << ") entry.cached.has_value()=" << viewCache.count(viewName) << "\n";
 
               evaluationStack.insert(viewName);
               struct EvaluationGuard { // RAII guard for evaluation stack cleanup
@@ -216,8 +215,15 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               }
 
               // Cache miss
+              auto cacheMissT0 = std::chrono::steady_clock::now();
               auto result = evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
                                      queryMetadata, true);
+              std::cerr << "[VE-TIME] QueryView(" << viewName.getName()
+                        << ") cache-miss FIRST evaluate() (symbolic tree walk, skipRewrite): "
+                        << std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                         cacheMissT0)
+                               .count()
+                        << "s\n";
 
               // Check if already registered to avoid duplicates
               if (!defaultCacheRegistry.count(viewName)) {
@@ -226,11 +232,21 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                                                 ? ExecutionStrategy::Standard
                                                 : ExecutionStrategy::IsolatedMeasurement);
 
-                Expression entryValue =
-                    strategy == ExecutionStrategy::IsolatedMeasurement
-                        ? evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
-                                   queryMetadata, true, true)
-                        : std::move(result);
+                Expression entryValue;
+                if (strategy == ExecutionStrategy::IsolatedMeasurement) {
+                  auto isolatedT0 = std::chrono::steady_clock::now();
+                  entryValue =
+                      evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
+                               queryMetadata, true, true);
+                  std::cerr << "[VE-TIME] QueryView(" << viewName.getName()
+                            << ") cache-miss SECOND evaluate() (IsolatedMeasurement, flatten=true): "
+                            << std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                             isolatedT0)
+                                   .count()
+                            << "s\n";
+                } else {
+                  entryValue = std::move(result);
+                }
 
                 defaultCacheRegistry[viewName] = CacheEntry{
                     std::move(entryValue),
@@ -250,11 +266,17 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               if (!topLevel) {
                 throw std::runtime_error("WithCaches can only be used at the top level");
               }
+              auto withCachesT0 = std::chrono::steady_clock::now();
 
+              auto unpackT0 = std::chrono::steady_clock::now();
               auto finalExpr = unpackWithCaches(
                   Expression(ComplexExpression(std::move(head), std::move(statics),
                                                std::move(dynamics), std::move(spans))),
                   defaultCacheRegistry);
+              std::cerr << "[VE-TIME] WithCaches: unpackWithCaches(): "
+                        << std::chrono::duration<double>(std::chrono::steady_clock::now() - unpackT0)
+                               .count()
+                        << "s\n";
 
               // Phase 1: Collect all execution measurements
               for (auto &[name, entry] : defaultCacheRegistry) {
@@ -268,6 +290,13 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 storeIfPositive(it->second.reuseCost, entry.reuseCost);
                 storeIfPositive(it->second.marginalComputeCost, entry.marginalComputeCost);
                 it->second.size = computeSize(entry.value);
+
+                std::cerr << "[VE-COST] " << name.getName()
+                          << " computeCost=" << it->second.computeCost
+                          << " materialiseCost=" << it->second.materialiseCost
+                          << " reuseCost=" << it->second.reuseCost
+                          << " marginalComputeCost=" << it->second.marginalComputeCost
+                          << " size=" << it->second.size << " bytes\n";
               }
 
               // Phase 2: Batch split - split this pass's candidates by decision
@@ -288,6 +317,13 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 // stay defensive, and use the true cost memo to avoid redundant computations
                 auto b = benefit(name, queryMetadata->trueCostMemo, true).value_or(0.0);
 
+                std::cerr << "[VE-COST] " << name.getName() << " decision="
+                          << (decision == CachingDecision::Admit
+                                  ? "Admit"
+                                  : (decision == CachingDecision::Reject ? "Reject" : "Defer"))
+                          << " benefit=" << b << " size=" << viewEntry.size << " bytes"
+                          << " tier=" << (decision == CachingDecision::Admit ? "1" : "2") << "\n";
+
                 AdmissionCandidate candidate{name, viewEntry.size, b};
                 (decision == CachingDecision::Admit ? tier1 : tier2)
                     .push_back(std::move(candidate));
@@ -300,6 +336,9 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
 
                 // Same as above
                 auto b = benefit(cachedName, queryMetadata->trueCostMemo, true).value_or(0.0);
+                std::cerr << "[VE-COST] " << cachedName.getName()
+                          << " (previously cached, competing for eviction) benefit=" << b
+                          << " size=" << viewRegistry.at(cachedName).size << " bytes tier=2\n";
                 tier2.push_back({cachedName, viewRegistry.at(cachedName).size, b});
               }
 
@@ -341,14 +380,35 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 }
               }
 
+              {
+                std::cerr << "[VE-COST] === admission result: " << finalSet.size()
+                          << " view(s) admitted, occupancy=" << viewCacheOccupancy << "/"
+                          << viewCacheSize << " bytes ===\n";
+                for (auto const &name : finalSet) std::cerr << "[VE-COST]   admitted: " << name.getName() << "\n";
+              }
+
               // If final expression is a materialised Table, return the result, otherwise run it
               // through evaluation for unevaluated CacheRefs; shouldn't happen in practice
               auto *finalCE = std::get_if<ComplexExpression>(&finalExpr);
-              Expression result = (finalCE && finalCE->getHead() != "Table"_)
-                                      ? evaluate(std::move(finalExpr), queryMetadata, true)
-                                      : std::move(finalExpr);
+              Expression result;
+              if (finalCE && finalCE->getHead() != "Table"_) {
+                auto leftoverT0 = std::chrono::steady_clock::now();
+                result = evaluate(std::move(finalExpr), queryMetadata, true);
+                std::cerr << "[VE-TIME] WithCaches: leftover-CacheRef evaluate() (unexpected path): "
+                          << std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                           leftoverT0)
+                                 .count()
+                          << "s\n";
+              } else {
+                result = std::move(finalExpr);
+              }
 
               defaultCacheRegistry.clear();
+              std::cerr << "[VE-TIME] WithCaches block total (unpack+admission+finalize): "
+                        << std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                         withCachesT0)
+                               .count()
+                        << "s\n";
               return result;
             }
 
@@ -671,10 +731,15 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
 }
 
 extern "C" BOSSExpression *evaluate(BOSSExpression *e) {
+  auto t0 = std::chrono::steady_clock::now();
   defaultCacheRegistry.clear();
   resolvedCacheRefs.clear();
   ++veTick;
   auto result = evaluate(std::move(e->delegate), nullptr, false, false, true);
+
+  auto totalSecs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  std::cerr << "[VE-TIME] === VE top-level evaluate() call (veTick=" << veTick
+            << ") total: " << totalSecs << "s ===\n";
 
   if (defaultCacheRegistry.empty())
     return new BOSSExpression{.delegate = std::move(result)};

@@ -1164,3 +1164,122 @@
           (ve-ve-eval (Filter
               (Join dp_returns dp_products (Equal dp_return_product_id dp_product_id))
               (Greater dp_product_price 5))))))
+
+
+(test-group "Domain predicate on a column projected out of the view"
+
+  (ve-ve-eval (ClearViews))
+  (ve-ve-eval (ClearTables))
+
+  (ve-ve-eval (RegisterTable cd_products "/data/cd_products.tbl" "/lib/loader.so" #f
+             cd_product_id cd_product_name cd_product_price))
+
+  ;; --- View filters on a column it then projects out: a stronger query predicate on that
+  ;; --- column can't be re-applied as a residual filter, since the column is gone from the
+  ;; --- view's output. Must NOT rewrite. ---
+
+  (test "Regression: view predicate weaker but on a column projected out is not rewritable"
+        '(Project (Filter (ByName cd_products) (Greater cd_product_price 100))
+                  cd_product_id cd_product_name)
+        (begin
+          (ve-ve-eval (ClearViews))
+          (ve-ve-eval (DefineView CD_DROPPED_VIEW
+              (Project (Filter cd_products (Greater cd_product_price 50))
+                       cd_product_id cd_product_name)))
+          (ve-ve-eval (Project
+              (Filter cd_products (Greater cd_product_price 100))
+              cd_product_id cd_product_name))))
+
+  ;; --- Control: same shape, but the view keeps the filtered column in its projection, so the
+  ;; --- stronger query predicate can be applied as a residual Filter, with a residual Project
+  ;; --- on top to trim back down to what the query needs. ---
+
+  (test "View predicate weaker on a column still present in the projection is rewritable"
+        '(Project
+          (Filter
+            (Project (Filter (ByName cd_products) (Greater cd_product_price 50))
+                     cd_product_id cd_product_name cd_product_price)
+            (Greater cd_product_price 100))
+          cd_product_id)
+        (begin
+          (ve-ve-eval (ClearViews))
+          (ve-ve-eval (DefineView CD_KEPT_VIEW
+              (Project (Filter cd_products (Greater cd_product_price 50))
+                       cd_product_id cd_product_name cd_product_price)))
+          (ve-ve-eval (Project
+              (Filter cd_products (Greater cd_product_price 100))
+              cd_product_id)))))
+
+
+(test-group "Opaque predicate on a column projected out of the view"
+
+  (ve-ve-eval (ClearViews))
+  (ve-ve-eval (ClearTables))
+
+  (ve-ve-eval (RegisterTable op_products "/data/op_products.tbl" "/lib/loader.so" #f
+             op_id op_name op_price))
+
+  ;; --- View has no opaque predicate on a column it projects out; the query's opaque predicate
+  ;; --- on that column would need a residual filter, but the column is gone from the view's
+  ;; --- output. Must NOT rewrite. ---
+
+  (test "Regression: query's opaque predicate on a column projected out is not rewritable"
+        '(Project (Filter (ByName op_products) (IsValid op_name)) op_id op_price)
+        (begin
+          (ve-ve-eval (ClearViews))
+          (ve-ve-eval (DefineView OP_DROPPED_VIEW
+              (Project op_products op_id op_price)))
+          (ve-ve-eval (Project
+              (Filter op_products (IsValid op_name))
+              op_id op_price))))
+
+  ;; --- Control: same shape, but the view keeps the predicated column in its projection, so the
+  ;; --- query's opaque predicate can be applied as a residual Filter. ---
+
+  (test "Query's opaque predicate on a column still present in the projection is rewritable"
+        '(Project
+          (Filter
+            (Project (ByName op_products) op_id op_name op_price)
+            (IsValid op_name))
+          op_id)
+        (begin
+          (ve-ve-eval (ClearViews))
+          (ve-ve-eval (DefineView OP_KEPT_VIEW
+              (Project op_products op_id op_name op_price)))
+          (ve-ve-eval (Project
+              (Filter op_products (IsValid op_name))
+              op_id)))))
+
+
+(test-group "View missing a table/join the query needs"
+
+  (ve-ve-eval (ClearViews))
+  (ve-ve-eval (ClearTables))
+
+  (ve-ve-eval (RegisterTable jp_a "/data/jp_a.tbl" "/lib/loader.so" #f jp_a_id jp_a_val))
+  (ve-ve-eval (RegisterTable jp_b "/data/jp_b.tbl" "/lib/loader.so" #f jp_b_id))
+
+  ;; --- Regression: a view over only one side of a join must not be used to answer a query that
+  ;; --- joins in a second table - there's no residual Join, so the join (and its row-filtering
+  ;; --- effect) would silently vanish from the rewritten query. Must NOT rewrite. ---
+
+  (test "Regression: view missing a joined table is not rewritable, even projecting only the covered side"
+        '(Project (Join (ByName jp_a) (ByName jp_b) (Equal jp_a_id jp_b_id)) jp_a_id jp_a_val)
+        (begin
+          (ve-ve-eval (ClearViews))
+          (ve-ve-eval (DefineView JP_A_ONLY (Project jp_a jp_a_id jp_a_val)))
+          (ve-ve-eval (Project
+              (Join jp_a jp_b (Equal jp_a_id jp_b_id))
+              jp_a_id jp_a_val))))
+
+  ;; --- Control: same shape, but the view already performs the join - must rewrite. ---
+
+  (test "View covering both joined tables is rewritable"
+        '(Project (Join (ByName jp_a) (ByName jp_b) (Equal jp_a_id jp_b_id)) jp_a_id jp_a_val)
+        (begin
+          (ve-ve-eval (ClearViews))
+          (ve-ve-eval (DefineView JP_BOTH_VIEW
+              (Project (Join jp_a jp_b (Equal jp_a_id jp_b_id)) jp_a_id jp_a_val)))
+          (ve-ve-eval (Project
+              (Join jp_a jp_b (Equal jp_a_id jp_b_id))
+              jp_a_id jp_a_val)))))

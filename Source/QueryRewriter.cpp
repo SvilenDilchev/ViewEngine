@@ -393,6 +393,17 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
             const auto &head = ce.getHead();
             const auto &dynamics = ce.getDynamicArguments();
 
+            if (head == "Table"_) {
+              // A materialized Table's dynamic arguments are the actual data cells (ACE doesn't
+              // produce span-based columns, so a real result can be millions of individual
+              // Expression args), not query structure - regular queries being rewritten never
+              // have an inlined Table whose contents affect the signature (ByName/QueryView/
+              // predicates never appear inside one), so recursing into it is always wasted work,
+              // cheap for a small literal and very expensive for a real materialized result at
+              // the tail of a VE->ACE->VE pipeline. Treat it as an opaque leaf.
+              return;
+            }
+
             if (head == "QueryView"_) {
               // Treat malformed QueryView as side effect
               if (dynamics.size() < 2 || dynamics.size() > 4) {
@@ -1017,16 +1028,26 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
   if (viewParts.hasUnsafeJoinPredicate || queryParts.hasUnsafeJoinPredicate)
     return -1.0;
 
-  // Condition 1: view must share at least one table with the query
+  // Condition 1: view must cover every table the query needs. There's no residual Join
+  // construction in findRewriting, only residual Filter/Project, so a view missing a table the
+  // query joins in can't be patched up afterwards - the join (and its row-filtering/duplicating
+  // effect) would just silently vanish from the rewritten query.
   size_t commonTables = 0;
   for (const auto &table : viewParts.baseTables)
     if (queryParts.baseTables.count(table))
       ++commonTables;
 
-  if (commonTables == 0)
+  if (commonTables != queryParts.baseTables.size())
     return -1.0;
 
   double tableCoverage = (double)commonTables / (double)queryParts.baseTables.size();
+
+  // A non-exact predicate match on `col` needs a residual filter re-applied on top of the view's
+  // output; if the view's projection drops that column, there's no way to re-filter on it, so the
+  // view can't be used to answer that predicate at all.
+  auto columnSurvivesProjection = [&](const boss::Symbol &col) {
+    return viewParts.projectedColumns.empty() || viewParts.projectedColumns.count(col) > 0;
+  };
 
   // Condition 2: the view must have weaker predicates than the query on shared tables
   size_t totalQueryPreds = 0;
@@ -1048,14 +1069,26 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
         return -1.0;
 
     totalQueryPreds += queryPreds.size();
-    for (const auto &[key, _] : queryPreds)
+    bool needsResidual = false;
+    for (const auto &[key, _] : queryPreds) {
       if (viewPreds.count(key))
         ++coveredQueryPreds;
+      else
+        needsResidual = true; // query has an opaque predicate on `col` the view doesn't already
+                              // apply, so it'll need a residual filter referencing `col`
+    }
+    if (needsResidual && !columnSurvivesProjection(col))
+      return -1.0; // the view projects `col` out, so that residual filter can't be re-applied
   }
 
   for (const auto &[col, queryPreds] : queryParts.columnPredicates)
-    if (!viewParts.columnPredicates.count(col))
+    if (!viewParts.columnPredicates.count(col)) {
+      // View has no opaque predicate on `col` at all, so the query's would need to be applied
+      // in full as a residual filter; reject if the view doesn't expose the column for it
+      if (!columnSurvivesProjection(col))
+        return -1.0;
       totalQueryPreds += queryPreds.size();
+    }
 
   // 2b: domain predicates (Equal/NotEqual/Greater/GreaterEqual/Less/LessEqual/Between), compared
   // semantically and scored for partial coverage
@@ -1072,14 +1105,22 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
     if (coverage == DomainCoverage::NONE)
       return -1.0; // View's domain predicate is stronger than the query's, can't use it
 
+    if (coverage != DomainCoverage::EQUAL && !columnSurvivesProjection(col))
+      return -1.0; // View's predicate is weaker than the query's and needs tightening via a
+                   // residual filter, but the view projects this column out
+
     coveredQueryPreds += (coverage == DomainCoverage::EQUAL) ? 1.0 : 0.5;
   }
 
   totalQueryPreds += queryParts.columnDomains.size();
   for (const auto &[col, queryDomain] : queryParts.columnDomains)
-    if (!viewParts.columnDomains.count(col))
+    if (!viewParts.columnDomains.count(col)) {
+      if (!columnSurvivesProjection(col))
+        return -1.0; // View is unfiltered on this column and would need a residual filter for
+                     // it, but the view projects this column out
       coveredQueryPreds += 0.5; // View doesn't have a domain predicate on a column the query does,
                                 // usable but not exactly matching, so give partial credit
+    }
 
   double predicateCoverage =
       (totalQueryPreds > 0) ? (double)coveredQueryPreds / (double)totalQueryPreds : 1.0;
@@ -1113,6 +1154,11 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
   double joinCoverage = queryParts.joinEdges.empty() ? 1.0
                                                      : (double)matchedQueryJoinIndices.size() /
                                                            (double)queryParts.joinEdges.size();
+
+  // Same reasoning as Condition 1: a join the query needs that the view doesn't already have
+  // can't be synthesised as a residual afterwards, so the view can't be used at all.
+  if (joinCoverage < 1.0)
+    return -1.0;
 
   // Condition 4: the view must project at least all the columns the query projects
   double projectionCoverage = 1.0;
