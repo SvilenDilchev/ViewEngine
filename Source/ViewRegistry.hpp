@@ -8,6 +8,9 @@
 struct ViewEntry {
   Expression definition;
   std::unordered_set<boss::Symbol> dependencies;
+  std::unordered_set<boss::Symbol>
+      expandedBaseTables; // base tables referenced in the view definition, including those from any
+                          // QueryView dependencies
   Signature signature;
 
   // Cost metrics corresponding to cache entry costs
@@ -54,6 +57,15 @@ bool hasCycle(const boss::Symbol &newView, const boss::Symbol &current,
 // depend on the given view
 void invalidateDependants(const boss::Symbol &invalidatedView,
                           std::unordered_set<boss::Symbol> &seen);
+
+// Recursively compute all the base tables directly and transitively referenced by a view
+// definition, including those from any QueryView dependencies
+// TODO: consider expanding and caching the full signature of a view at define time
+std::unordered_set<boss::Symbol> unionExpanded(const std::unordered_set<boss::Symbol> &baseTables,
+                                               const std::unordered_set<boss::Symbol> &dependencies,
+                                               std::unordered_set<boss::Symbol> &visited);
+std::unordered_set<boss::Symbol> expandBaseTables(const boss::Symbol &viewName,
+                                                  std::unordered_set<boss::Symbol> &visited);
 
 // Checks if the new value is > 0.0 and updates the target field if so
 void storeIfPositive(double &target, const double newValue);

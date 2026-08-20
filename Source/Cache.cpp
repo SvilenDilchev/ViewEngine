@@ -48,7 +48,31 @@ double estimateVarWidthSize(Range const &range, size_t totalCount, ByteSizeFunc 
   return avgBytes * static_cast<double>(totalCount);
 }
 
-// compute the size of a column from its dynamics
+// Compute the size of a column from its spans
+double sizeOfColumnSpans(boss::expressions::ExpressionSpanArguments const &spans) {
+  double total = 0.0;
+  for (auto const &span : spans) {
+    total += std::visit(
+        [](auto const &s) -> double {
+          using ElementT = std::remove_const_t<typename std::decay_t<decltype(s)>::element_type>;
+          if constexpr (std::is_same_v<ElementT, boss::Symbol>) {
+            return estimateVarWidthSize(s, s.size(), [](boss::Symbol const &sym) {
+              return static_cast<double>(sym.getName().size());
+            });
+          } else if constexpr (std::is_same_v<ElementT, std::string>) {
+            return estimateVarWidthSize(s, s.size(), [](std::string const &str) {
+              return static_cast<double>(str.size());
+            });
+          } else {
+            return static_cast<double>(s.size()) * sizeof(ElementT);
+          }
+        },
+        span);
+  }
+  return total;
+}
+
+// Compute the size of a column from its dynamics
 double sizeOfColumn(boss::ExpressionArguments const &dynamics) {
   if (dynamics.empty())
     return 0.0;
@@ -79,27 +103,10 @@ double computeSize(Expression const &tableExpr) {
     return 0.0; // Not a table expression, size is 0, cannot be admitted to the cache
 
   double total = 0.0;
-
-  // Go over spans, currently dead code because ACE does not produce spans, but we keep it for
-  // future-proofing
-  for (auto const &span : ce->getSpanArguments()) {
-    total += std::visit(
-        [](auto const &s) -> double {
-          using ElementT = std::remove_const_t<typename std::decay_t<decltype(s)>::element_type>;
-          if constexpr (std::is_same_v<ElementT, boss::Symbol>) {
-            return estimateVarWidthSize(s, s.size(), [](boss::Symbol const &sym) {
-              return static_cast<double>(sym.getName().size());
-            });
-          } else {
-            return static_cast<double>(s.size()) * sizeof(ElementT);
-          }
-        },
-        span);
-  }
-
   for (auto const &colExpr : ce->getDynamicArguments())
     if (auto const *col = std::get_if<ComplexExpression>(&colExpr))
-      total += sizeOfColumn(col->getDynamicArguments());
+      total += col->getDynamicArguments().empty() ? sizeOfColumnSpans(col->getSpanArguments())
+                                                   : sizeOfColumn(col->getDynamicArguments());
 
   return total;
 }

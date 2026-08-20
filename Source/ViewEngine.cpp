@@ -3,8 +3,6 @@
 #include "MetadataRegistry.hpp"
 #include "ViewRegistry.hpp"
 
-#include <chrono>
-#include <iostream>
 #include <unordered_set>
 #include <utility>
 
@@ -61,6 +59,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               auto viewName = std::move(*name);
 
               // TODO: use metadata from the top instead of re-walking the view definition
+              // TODO: block defining a view that queries a view that has not yet been defined
               ViewMetadata metadata;
               walkView(dynamics[1], metadata); // Walk the view expression to collect data for
                                                // dependency graph construction and validation
@@ -75,33 +74,47 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                   return Expression(false); // Block if definition creates a cycle
               }
 
-              std::unordered_set<boss::Symbol> seen;
-              invalidateDependants(viewName, seen);
-
-              // Remove old index entries if view already exists
+              // Clear the entries in the indexes that contain the view that's being redefined
               if (auto existing = viewRegistry.find(viewName); existing != viewRegistry.end()) {
-                viewCacheOccupancy -= existing->second.size; // Remove old size from occupancy
-                for (const auto &tableName : existing->second.signature.baseTables)
+                if (viewCache.count(viewName)) {
+                  viewCache.erase(viewName);
+                  viewCacheOccupancy -= existing->second.size;
+                }
+                for (const auto &tableName : existing->second.expandedBaseTables)
                   tableToViews[tableName].erase(viewName);
                 for (const auto &dep : existing->second.dependencies)
                   viewToViews[dep].erase(viewName);
               }
 
-              // Add new index entries
-              // TODO: expand signature at define time and populate tableToViews with full
-              // transitive base table set — would allow findRewriting to use tableToViews for
-              // efficient candidate lookup instead of scanning the full registry. Same DFS pass
-              // could replace hasCycle traversal above, doing cycle detection and index building in
-              // one walk.
-              for (const auto &tableName : metadata.signature.baseTables)
-                tableToViews[tableName].insert(viewName);
+              std::unordered_set<boss::Symbol> seen;
+              invalidateDependants(viewName, seen);
+
+              // Clear the table index of any dependants that were invalidated, since their
+              // expandedBaseTables will be recomputed below
+              for (const auto &dependant : seen)
+                for (const auto &tableName : viewRegistry.at(dependant).expandedBaseTables)
+                  tableToViews[tableName].erase(dependant);
+
+              // Recompute the expandedBaseTables for the view being defined
+              std::unordered_set<boss::Symbol> expandVisited;
+              auto newSelfExpanded = unionExpanded(metadata.signature.baseTables,
+                                                   metadata.dependencies, expandVisited);
+              expandVisited.insert(viewName);
+
+              viewRegistry[viewName] = ViewEntry{std::move(dynamics[1]), metadata.dependencies,
+                                                 newSelfExpanded, metadata.signature};
+
+              // Update the indexes for the new view definition
               for (const auto &dep : metadata.dependencies)
                 viewToViews[dep].insert(viewName);
+              for (const auto &tableName : newSelfExpanded)
+                tableToViews[tableName].insert(viewName);
 
-              viewCache.erase(viewName); // Invalidate the cache for the view itself
-              viewRegistry[std::move(viewName)] =
-                  ViewEntry{std::move(dynamics[1]), std::move(metadata.dependencies),
-                            std::move(metadata.signature)};
+              // Recompute the expandedBaseTables for all dependants that were invalidated, and
+              // update the tableToViews index for them as well
+              for (const auto &dependant : seen)
+                for (const auto &tableName : expandBaseTables(dependant, expandVisited))
+                  tableToViews[tableName].insert(dependant);
 
               return Expression(true);
             }
@@ -215,15 +228,8 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               }
 
               // Cache miss
-              auto cacheMissT0 = std::chrono::steady_clock::now();
               auto result = evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
                                      queryMetadata, true);
-              std::cerr << "[VE-TIME] QueryView(" << viewName.getName()
-                        << ") cache-miss FIRST evaluate() (symbolic tree walk, skipRewrite): "
-                        << std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                                         cacheMissT0)
-                               .count()
-                        << "s\n";
 
               // Check if already registered to avoid duplicates
               if (!defaultCacheRegistry.count(viewName)) {
@@ -232,21 +238,11 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                                                 ? ExecutionStrategy::Standard
                                                 : ExecutionStrategy::IsolatedMeasurement);
 
-                Expression entryValue;
-                if (strategy == ExecutionStrategy::IsolatedMeasurement) {
-                  auto isolatedT0 = std::chrono::steady_clock::now();
-                  entryValue =
-                      evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
-                               queryMetadata, true, true);
-                  std::cerr << "[VE-TIME] QueryView(" << viewName.getName()
-                            << ") cache-miss SECOND evaluate() (IsolatedMeasurement, flatten=true): "
-                            << std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                                             isolatedT0)
-                                   .count()
-                            << "s\n";
-                } else {
-                  entryValue = std::move(result);
-                }
+                Expression entryValue =
+                    strategy == ExecutionStrategy::IsolatedMeasurement
+                        ? evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
+                                   queryMetadata, true, true)
+                        : std::move(result);
 
                 defaultCacheRegistry[viewName] = CacheEntry{
                     std::move(entryValue),
@@ -266,17 +262,11 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               if (!topLevel) {
                 throw std::runtime_error("WithCaches can only be used at the top level");
               }
-              auto withCachesT0 = std::chrono::steady_clock::now();
 
-              auto unpackT0 = std::chrono::steady_clock::now();
               auto finalExpr = unpackWithCaches(
                   Expression(ComplexExpression(std::move(head), std::move(statics),
                                                std::move(dynamics), std::move(spans))),
                   defaultCacheRegistry);
-              std::cerr << "[VE-TIME] WithCaches: unpackWithCaches(): "
-                        << std::chrono::duration<double>(std::chrono::steady_clock::now() - unpackT0)
-                               .count()
-                        << "s\n";
 
               // Phase 1: Collect all execution measurements
               for (auto &[name, entry] : defaultCacheRegistry) {
@@ -290,13 +280,6 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 storeIfPositive(it->second.reuseCost, entry.reuseCost);
                 storeIfPositive(it->second.marginalComputeCost, entry.marginalComputeCost);
                 it->second.size = computeSize(entry.value);
-
-                std::cerr << "[VE-COST] " << name.getName()
-                          << " computeCost=" << it->second.computeCost
-                          << " materialiseCost=" << it->second.materialiseCost
-                          << " reuseCost=" << it->second.reuseCost
-                          << " marginalComputeCost=" << it->second.marginalComputeCost
-                          << " size=" << it->second.size << " bytes\n";
               }
 
               // Phase 2: Batch split - split this pass's candidates by decision
@@ -317,13 +300,6 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 // stay defensive, and use the true cost memo to avoid redundant computations
                 auto b = benefit(name, queryMetadata->trueCostMemo, true).value_or(0.0);
 
-                std::cerr << "[VE-COST] " << name.getName() << " decision="
-                          << (decision == CachingDecision::Admit
-                                  ? "Admit"
-                                  : (decision == CachingDecision::Reject ? "Reject" : "Defer"))
-                          << " benefit=" << b << " size=" << viewEntry.size << " bytes"
-                          << " tier=" << (decision == CachingDecision::Admit ? "1" : "2") << "\n";
-
                 AdmissionCandidate candidate{name, viewEntry.size, b};
                 (decision == CachingDecision::Admit ? tier1 : tier2)
                     .push_back(std::move(candidate));
@@ -336,9 +312,6 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
 
                 // Same as above
                 auto b = benefit(cachedName, queryMetadata->trueCostMemo, true).value_or(0.0);
-                std::cerr << "[VE-COST] " << cachedName.getName()
-                          << " (previously cached, competing for eviction) benefit=" << b
-                          << " size=" << viewRegistry.at(cachedName).size << " bytes tier=2\n";
                 tier2.push_back({cachedName, viewRegistry.at(cachedName).size, b});
               }
 
@@ -380,83 +353,12 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 }
               }
 
-              {
-                std::cerr << "[VE-COST] === admission result: " << finalSet.size()
-                          << " view(s) admitted, occupancy=" << viewCacheOccupancy << "/"
-                          << viewCacheSize << " bytes ===\n";
-                for (auto const &name : finalSet) std::cerr << "[VE-COST]   admitted: " << name.getName() << "\n";
-              }
-
-              // If final expression is a materialised Table, return the result, otherwise run it
-              // through evaluation for unevaluated CacheRefs; shouldn't happen in practice
+              // Final result should be a materialised "Table"_ from ACE
               auto *finalCE = std::get_if<ComplexExpression>(&finalExpr);
-              Expression result;
-              if (finalCE && finalCE->getHead() != "Table"_) {
-                auto leftoverT0 = std::chrono::steady_clock::now();
-                result = evaluate(std::move(finalExpr), queryMetadata, true);
-                std::cerr << "[VE-TIME] WithCaches: leftover-CacheRef evaluate() (unexpected path): "
-                          << std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                                           leftoverT0)
-                                 .count()
-                          << "s\n";
-              } else {
-                result = std::move(finalExpr);
-              }
+              Expression result = std::move(finalExpr);
 
               defaultCacheRegistry.clear();
-              std::cerr << "[VE-TIME] WithCaches block total (unpack+admission+finalize): "
-                        << std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                                         withCachesT0)
-                               .count()
-                        << "s\n";
               return result;
-            }
-
-            // Handle leftover bare Pending CacheRef as the final expression of a WithCaches block
-            if (head == "CacheRef"_) {
-              if (dynamics.size() != 2)
-                throw std::runtime_error("CacheRef requires exactly 2 arguments");
-
-              auto *name = std::get_if<Symbol>(&dynamics[0]);
-              if (!name)
-                throw std::runtime_error("CacheRef first argument must be a symbol");
-
-              auto *type = std::get_if<Symbol>(&dynamics[1]);
-              if (!type)
-                throw std::runtime_error("CacheRef second argument must be a symbol");
-
-              if (*type != "Pending"_ && *type != "Borrowed"_)
-                throw std::runtime_error("CacheRef unknown type: " + type->getName());
-
-              auto const &viewName = *name;
-
-              // If during the WithCaches block the view was admitted to the cache,
-              // return its cached value
-              if (auto cacheIt = viewCache.find(viewName); cacheIt != viewCache.end())
-                return cacheIt->second.clone(CloneReason::EVALUATE_CONST_EXPRESSION);
-
-              // Otherwise, return the value from the cache registry,
-              // where it should still be present
-              auto regIt = defaultCacheRegistry.find(viewName);
-              if (regIt == defaultCacheRegistry.end())
-                throw std::runtime_error(
-                    "CacheRef could not be resolved, entry not found in cache registry: " +
-                    viewName.getName());
-
-              if (resolvedCacheRefs.count(viewName))
-                // ACE should resolve all cache references. The only exception is a single bare
-                // Pending CacheRef as the final expression of the WithCaches wrapper. This guard is
-                // here if either a computational engines (like ACE) is not used and consequently
-                // multiple CacheRefs are not resolved. This block only allows for one CacheRef to a
-                // view to be resolved due to the move, which is correct behaviour, but if something
-                // goes wrong we want to catch it and throw instead of silently have something go
-                // wrong. In practice this should never fire.
-                throw std::runtime_error(
-                    "CacheRef for " + viewName.getName() +
-                    " referenced more than once in a single pass without an intervening "
-                    "materialising engine");
-
-              return std::move(regIt->second.value);
             }
 
             if (head == "DropView"_) {
@@ -485,13 +387,15 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 return Expression(false); // Dropping a non-existent view fails gracefully
 
               // Cleanup indexes
-              for (const auto &tableName : it->second.signature.baseTables)
+              for (const auto &tableName : it->second.expandedBaseTables)
                 tableToViews[tableName].erase(viewName);
               for (const auto &dep : it->second.dependencies)
                 viewToViews[dep].erase(viewName);
 
-              viewCacheOccupancy -= it->second.size; // Remove old size from occupancy
-              viewCache.erase(viewName);             // Invalidate the cache for the view itself
+              if (viewCache.count(viewName)) {
+                viewCacheOccupancy -= it->second.size; // Remove old size from occupancy
+                viewCache.erase(viewName);             // Invalidate the cache for the view itself
+              }
               viewRegistry.erase(it);
               return Expression(true);
             }
@@ -731,15 +635,10 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
 }
 
 extern "C" BOSSExpression *evaluate(BOSSExpression *e) {
-  auto t0 = std::chrono::steady_clock::now();
   defaultCacheRegistry.clear();
   resolvedCacheRefs.clear();
   ++veTick;
   auto result = evaluate(std::move(e->delegate), nullptr, false, false, true);
-
-  auto totalSecs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  std::cerr << "[VE-TIME] === VE top-level evaluate() call (veTick=" << veTick
-            << ") total: " << totalSecs << "s ===\n";
 
   if (defaultCacheRegistry.empty())
     return new BOSSExpression{.delegate = std::move(result)};

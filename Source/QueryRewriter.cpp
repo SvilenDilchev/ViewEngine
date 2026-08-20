@@ -4,6 +4,9 @@
 #include "MetadataRegistry.hpp"
 #include "ViewRegistry.hpp"
 #include <Expression.hpp>
+
+#include <algorithm>
+#include <ranges>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -95,16 +98,12 @@ canonicalSourceKey(const std::unordered_set<boss::Symbol> &sources) {
 // Used to walk As operator expressions saved in projectedColumns
 // and to get the columns referenced in Or expressions that are stored as opaque predicates
 static void extractColumnsFromExpr(const Expression &expr, std::unordered_set<boss::Symbol> &out) {
-  std::visit(boss::utilities::overload(
-                 [&](const Symbol &s) {
-                   if (columnRegistry.find(s) != columnRegistry.end())
-                     out.insert(s);
-                 },
-                 [&](const ComplexExpression &ce) {
-                   for (const auto &arg : ce.getDynamicArguments())
-                     extractColumnsFromExpr(arg, out);
-                 },
-                 [](const auto &) {}),
+  std::visit(boss::utilities::overload([&](const Symbol &s) { out.insert(s); },
+                                       [&](const ComplexExpression &ce) {
+                                         for (const auto &arg : ce.getDynamicArguments())
+                                           extractColumnsFromExpr(arg, out);
+                                       },
+                                       [](const auto &) {}),
              expr);
 }
 
@@ -194,6 +193,16 @@ static ColumnDomain intersectDomains(const ColumnDomain &a, const ColumnDomain &
   return result;
 }
 
+// Compares two projected column expressions with the same name.
+static bool projectedExprsMatch(const std::shared_ptr<Expression> &a,
+                                const std::shared_ptr<Expression> &b) {
+  if (!a && !b)
+    return true; // both are null, so they match
+  if (!a || !b)
+    return false; // One is aliased and the other is not, so they don't match
+  return serialiseExpr(*a) == serialiseExpr(*b); // Compare the serialised expressions for equality
+}
+
 // Merge that results in the intersection of the predicates in the two signatures
 // Used for And operator handling in Filters and for Join operator handling
 void ViewMetadata::intersectMerge(ViewMetadata &&other) {
@@ -215,7 +224,7 @@ void ViewMetadata::intersectMerge(ViewMetadata &&other) {
   for (auto &[col, expr] : other.signature.projectedColumns) {
     auto it = signature.projectedColumns.find(col);
     if (it != signature.projectedColumns.end()) {
-      if (serialiseExpr(*it->second) != serialiseExpr(*expr)) {
+      if (!projectedExprsMatch(it->second, expr)) {
         // Conflicting projections on the same column from different join branches
         sideEffect = true;
         return;
@@ -1023,6 +1032,46 @@ static DomainCoverage domainCoverage(const ColumnDomain &viewDomain,
   return allExact ? DomainCoverage::EQUAL : DomainCoverage::COVERS;
 }
 
+// Extracts a numeric value out of a DomainValue for width computation; bool/string values have
+// no meaningful numeric width, so those report nullopt and callers fall back to a flat credit
+static std::optional<double> numericValue(const DomainValue &value) {
+  if (const auto *i = std::get_if<int64_t>(&value))
+    return static_cast<double>(*i);
+  if (const auto *d = std::get_if<double>(&value))
+    return *d;
+  return std::nullopt;
+}
+
+// Width of a single closed numeric interval; nullopt if either bound is missing (unbounded) or
+// non-numeric - callers fall back to a flat credit in that case
+static std::optional<double> intervalWidth(const Interval &interval) {
+  if (!interval.lower || !interval.upper)
+    return std::nullopt;
+  auto lower = numericValue(*interval.lower);
+  auto upper = numericValue(*interval.upper);
+  if (!lower || !upper)
+    return std::nullopt;
+  return *upper - *lower;
+}
+
+// Credit for a non-exact (COVERS, not EQUAL) domain match: how much of the possible values in the
+// view's domain are actually required by the query's domain. Only reached if the view does indeed
+// cover the query's full domain.
+static double domainCoverageCredit(const ColumnDomain *viewDomain,
+                                   const ColumnDomain &queryDomain) {
+  if (!viewDomain)
+    return MIN_DOMAIN_PARTIAL_CREDIT;
+
+  if (viewDomain->ranges.size() == 1 && queryDomain.ranges.size() == 1) {
+    auto queryWidth = intervalWidth(queryDomain.ranges[0]);
+    auto viewWidth = intervalWidth(viewDomain->ranges[0]);
+    if (queryWidth && viewWidth && *viewWidth > 0.0)
+      return std::clamp(*queryWidth / *viewWidth, MIN_DOMAIN_PARTIAL_CREDIT, 1.0);
+  }
+
+  return FALLBACK_DOMAIN_PARTIAL_CREDIT;
+}
+
 double scoreView(const Signature &viewParts, const Signature &queryParts) {
   // Condition 0: flags that directly block the rewriting process
   if (viewParts.hasUnsafeJoinPredicate || queryParts.hasUnsafeJoinPredicate)
@@ -1040,7 +1089,9 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
   if (commonTables != queryParts.baseTables.size())
     return -1.0;
 
-  double tableCoverage = (double)commonTables / (double)queryParts.baseTables.size();
+  double tableCoverage = queryParts.baseTables.empty()
+                             ? 1.0
+                             : (double)commonTables / (double)queryParts.baseTables.size();
 
   // A non-exact predicate match on `col` needs a residual filter re-applied on top of the view's
   // output; if the view's projection drops that column, there's no way to re-filter on it, so the
@@ -1050,8 +1101,8 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
   };
 
   // Condition 2: the view must have weaker predicates than the query on shared tables
-  size_t totalQueryPreds = 0;
-  size_t coveredQueryPreds = 0;
+  double totalQueryPreds = 0;
+  double coveredQueryPreds = 0;
 
   // 2a: opaque predicates (Like/Match_Substring/IsValid/col-vs-col), compared syntactically
   for (const auto &[col, viewPreds] : viewParts.columnPredicates) {
@@ -1098,9 +1149,6 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
       return -1.0; // View has a domain predicate on a column the query doesn't
 
     const auto &queryDomain = qIt->second;
-    // TODO: accurate partial credit for domain coverage (e.g. view has a weaker range than the
-    // query, but not fully covering it), currently we just give 0.5 credit for any non-exact
-    // coverage, and 1.0 for exact coverage
     DomainCoverage coverage = domainCoverage(viewDomain, queryDomain);
     if (coverage == DomainCoverage::NONE)
       return -1.0; // View's domain predicate is stronger than the query's, can't use it
@@ -1109,7 +1157,8 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
       return -1.0; // View's predicate is weaker than the query's and needs tightening via a
                    // residual filter, but the view projects this column out
 
-    coveredQueryPreds += (coverage == DomainCoverage::EQUAL) ? 1.0 : 0.5;
+    coveredQueryPreds +=
+        (coverage == DomainCoverage::EQUAL) ? 1.0 : domainCoverageCredit(&viewDomain, queryDomain);
   }
 
   totalQueryPreds += queryParts.columnDomains.size();
@@ -1118,12 +1167,12 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
       if (!columnSurvivesProjection(col))
         return -1.0; // View is unfiltered on this column and would need a residual filter for
                      // it, but the view projects this column out
-      coveredQueryPreds += 0.5; // View doesn't have a domain predicate on a column the query does,
-                                // usable but not exactly matching, so give partial credit
+      // View doesn't have a domain predicate on this column at all: usable but did no narrowing
+      // work for it, so this is floored below any real (even wide) predicate's credit
+      coveredQueryPreds += domainCoverageCredit(nullptr, queryDomain);
     }
 
-  double predicateCoverage =
-      (totalQueryPreds > 0) ? (double)coveredQueryPreds / (double)totalQueryPreds : 1.0;
+  double predicateCoverage = (totalQueryPreds > 0) ? coveredQueryPreds / totalQueryPreds : 1.0;
 
   // Condition 3: the join predicates of the view are non-destructive to the query's join
   // predicates
@@ -1165,13 +1214,12 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
   if (!viewParts.projectedColumns.empty() && !queryParts.projectedColumns.empty()) {
     for (const auto &[col, queryExpr] : queryParts.projectedColumns) {
       auto it = viewParts.projectedColumns.find(col);
-      if (it == viewParts.projectedColumns.end()) {
+      if (it == viewParts.projectedColumns.end())
         // TODO: check if any view projection has the same underlying expression but a different
         // name — if so, a rename Project on top of the view could satisfy the query (partial
         // match)
         return -1.0;
-      }
-      if (it->second && queryExpr && serialiseExpr(*it->second) != serialiseExpr(*queryExpr))
+      if (!projectedExprsMatch(it->second, queryExpr))
         return -1.0;
     }
     // Score is how many more columns the view projects on top of what the query needs,
@@ -1208,7 +1256,7 @@ double scoreView(const Signature &viewParts, const Signature &queryParts) {
       if (expr)
         return -1.0; // TODO: Have to check if the expression can be computed (partial matching)
                      // from the base columns, as there is no projected column to match against.
-      else if (!viewColumns.count(col))
+      if (!viewColumns.count(col))
         return -1.0; // View doesn't project a column the query needs
     }
 
@@ -1396,8 +1444,13 @@ candidateViewRewriteComparator(boss::Symbol const &bestName, double bestScore,
       return hasCostBest; // if only one has cost info, select the other one to gather its info
     // both have cost info — fall through to cost comparison
   } else if (cachedBest != cachedCand) {
+    // if the score gap is large enough, select the higher score even if it's uncached
+    double scoreGap = candScore - bestScore;
+    if (std::abs(scoreGap) >= SCORE_GAP_OVERRIDES_CACHE_PREFERENCE)
+      return scoreGap > 0;
+
     if (!hasCostBest || !hasCostCand)
-      return cachedCand; // if only one is cached, select the cached one
+      return cachedCand; // only one is cached, prefer the cached one
     // both cached-or-not with cost info — fall through to cost comparison
   }
 
@@ -1407,7 +1460,34 @@ candidateViewRewriteComparator(boss::Symbol const &bestName, double bestScore,
   auto &candEntry = viewRegistry.at(candName);
   double effBest = cachedBest ? bestEntry.reuseCost : *costBest;
   double effCand = cachedCand ? candEntry.reuseCost : *costCand;
-  return effCand < effBest;
+  return effCand < effBest; // same cached status: lower effective cost wins
+}
+
+// Intersection of the views given by running a set of tables through the tableToViews index.
+static std::unordered_set<boss::Symbol>
+candidateViewsForTables(const std::unordered_set<boss::Symbol> &baseTables) {
+  if (baseTables.empty()) {
+    auto names = std::views::keys(viewRegistry);
+    return std::unordered_set<boss::Symbol>(names.begin(), names.end());
+  }
+
+  std::unordered_set<boss::Symbol> candidates;
+  bool first = true;
+  for (const auto &table : baseTables) {
+    auto it = tableToViews.find(table);
+    if (it == tableToViews.end())
+      return {};
+
+    if (first) {
+      candidates = it->second;
+      first = false;
+      continue;
+    }
+
+    std::erase_if(candidates, [&](const boss::Symbol &name) { return !it->second.count(name); });
+  }
+
+  return candidates;
 }
 
 std::optional<Expression> findRewriting(const Expression &query, ViewMetadata &queryMetadata,
@@ -1424,9 +1504,8 @@ std::optional<Expression> findRewriting(const Expression &query, ViewMetadata &q
   std::optional<boss::Symbol> bestName;
   double bestScore = -1.0;
 
-  // TODO: look into building a complete reverse index of base table -> top level views that
-  // reference it at define time to nuke the search space instead of scanning all views
-  for (auto &[name, entry] : viewRegistry) {
+  for (const auto &name : candidateViewsForTables(queryMetadata.signature.baseTables)) {
+    auto &entry = viewRegistry.at(name);
     ViewMetadata viewMeta;
     viewMeta.signature = entry.signature;
     viewMeta.dependencies = entry.dependencies;

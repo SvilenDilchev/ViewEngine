@@ -51,9 +51,10 @@ void invalidateDependants(const boss::Symbol &invalidatedView,
     seen.insert(dependant);
     auto vit = viewRegistry.find(dependant);
     if (vit != viewRegistry.end()) {
-      viewCacheOccupancy -= vit->second.size;
-      viewCache.erase(dependant); // Invalidate the cache for the dependant view
-
+      if (viewCache.count(dependant)) {
+        viewCacheOccupancy -= vit->second.size;
+        viewCache.erase(dependant); // Invalidate the cache for the dependant view
+      }
       // Invalidate the stale cost and size metrics for the dependant view as well
       vit->second.computeCost = 0.0;
       vit->second.materialiseCost = 0.0;
@@ -63,6 +64,29 @@ void invalidateDependants(const boss::Symbol &invalidatedView,
     }
     invalidateDependants(dependant, seen);
   }
+}
+
+std::unordered_set<boss::Symbol> unionExpanded(const std::unordered_set<boss::Symbol> &baseTables,
+                                               const std::unordered_set<boss::Symbol> &dependencies,
+                                               std::unordered_set<boss::Symbol> &visited) {
+  std::unordered_set<boss::Symbol> result = baseTables;
+  for (const auto &dep : dependencies) {
+    auto depTables = expandBaseTables(dep, visited);
+    result.insert(depTables.begin(), depTables.end());
+  }
+  return result;
+}
+
+std::unordered_set<boss::Symbol> expandBaseTables(const boss::Symbol &viewName,
+                                                  std::unordered_set<boss::Symbol> &visited) {
+  auto it = viewRegistry.find(viewName);
+  if (it == viewRegistry.end())
+    return {};
+  if (!visited.insert(viewName).second)
+    return it->second.expandedBaseTables;
+  it->second.expandedBaseTables =
+      unionExpanded(it->second.signature.baseTables, it->second.dependencies, visited);
+  return it->second.expandedBaseTables;
 }
 
 void storeIfPositive(double &target, const double newValue) {

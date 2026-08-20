@@ -17,10 +17,21 @@ using boss::ComplexExpression;
 using boss::Expression;
 using boss::Symbol;
 
-constexpr double W_TABLE = 0.40;
-constexpr double W_JOIN = 0.30;
-constexpr double W_PRED = 0.20;
+// Weights for the different components of a query signature when scoring a candidate view
+constexpr double W_TABLE = 0.30;
+constexpr double W_JOIN = 0.20;
+constexpr double W_PRED = 0.40;
 constexpr double W_PROJ = 0.10;
+
+// Minimum score gap an uncached candidate view must have over a cached candidate view to override
+// it as the best match, even if the cached view has a lower true cost.
+constexpr double SCORE_GAP_OVERRIDES_CACHE_PREFERENCE = 0.1;
+// Credit floor for a domain match that's usable but did little/no real narrowing relative to
+// what the query needs (including a column the view has no predicate on at all)
+constexpr double MIN_DOMAIN_PARTIAL_CREDIT = 0.1;
+// Fallback credit for a non-exact match we can't reason about numerically (multi-range unions
+// from Or/NotEqual, unbounded sides, or non-numeric domain values)
+constexpr double FALLBACK_DOMAIN_PARTIAL_CREDIT = 0.5;
 
 // Used in scoring to determine if we need a residual filter for a specific domain
 enum class DomainCoverage { NONE, COVERS, EQUAL };

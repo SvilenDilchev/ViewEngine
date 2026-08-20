@@ -15,12 +15,20 @@
 ;; Two ViewEngine passes, no ACE. When findRewriting matches an existing view,
 ;; VE1 substitutes in a QueryView-style reference, which always wraps itself in
 ;; WithCaches/Pending/CacheRef (the same protocol explicit QueryView caching
-;; uses). In the 3-engine pipeline ACE is what unwraps that on the way
-;; through; with ACE absent, a second VE pass does the same job - consuming
-;; the WithCaches wrapper and resolving the CacheRef back down to the plain
-;; rewritten expression these tests check, without needing any real data
-;; loaded. Use this whenever the query gets rewritten via an existing
-;; DefineView (not just bare-symbol/Gather substitution).
+;; uses). Resolving that wrapper - unpacking WithCaches and substituting the
+;; CacheRef back down to a plain expression - is ACE's job alone; VE never
+;; resolves its own CacheRefs, on any pass. So with ACE absent, the matched
+;; view's own definition stays opaque as `(CacheRef viewName Pending|Borrowed)`
+;; in the output - VE2 only adds value here by confirming *which* view got
+;; matched and constructing the residual Filter/Project wrapped around that
+;; reference. Use this (instead of ve-ace-ve-eval) specifically when the
+;; matched view's own definition can't be pushed through real ACE without real
+;; backing data (e.g. it was built over RegisterTable'd tables with fake
+;; loader paths) - i.e. when checking rewriter/scoring logic (which view
+;; matched, what residual got added) rather than the resolved content itself.
+;; For anything built purely from literal Table data, prefer ve-ace-ve-eval -
+;; real ACE resolves it for free and the assertion can check the true
+;; materialised result instead of an opaque reference.
 (define-syntax ve-ve-eval
   (syntax-rules ()
     ((ve-ve-eval query)
@@ -107,25 +115,31 @@
 
 (test-group "QueryView"
 
+  ;; These are resolved via ve-ace-ve-eval (real ACE), not ve-ve-eval: resolving a
+  ;; QueryView/CacheRef is ACE's job, not VE's, on any pass - see the ve-ve-eval
+  ;; comment above. All bodies here are literal Table data, so real ACE needs no
+  ;; backing data to materialise them, and the expected values are now the real
+  ;; computed results rather than the unevaluated stored expression.
+
   (test "QueryView resolves to stored expression"
-        '(Filter (Table (A 1 2 3)) (Greater A 1))
+        '(Table (A 2 3))
         (begin
-          (ve-ve-eval (DefineView SIMPLE (Filter (Table (A 1 2 3)) (Greater A 1))))
-          (ve-ve-eval (QueryView SIMPLE Defer))))
+          (ve-ace-ve-eval (DefineView SIMPLE (Filter (Table (A 1 2 3)) (Greater A 1))))
+          (ve-ace-ve-eval (QueryView SIMPLE Defer))))
 
   (test "QueryView returns latest definition after overwrite"
         '(Table (A 10 20))
         (begin
-          (ve-ve-eval (DefineView OVERWRITE2 (Table (A 1 2))))
-          (ve-ve-eval (DefineView OVERWRITE2 (Table (A 10 20))))
-          (ve-ve-eval (QueryView OVERWRITE2 Defer))))
+          (ve-ace-ve-eval (DefineView OVERWRITE2 (Table (A 1 2))))
+          (ve-ace-ve-eval (DefineView OVERWRITE2 (Table (A 10 20))))
+          (ve-ace-ve-eval (QueryView OVERWRITE2 Defer))))
 
   (test "QueryView same view twice returns same expression"
         '(Table (A 1 2 3))
         (begin
-          (ve-ve-eval (DefineView REPEATED (Table (A 1 2 3))))
-          (ve-ve-eval (QueryView REPEATED Defer))
-          (ve-ve-eval (QueryView REPEATED Defer)))))
+          (ve-ace-ve-eval (DefineView REPEATED (Table (A 1 2 3))))
+          (ve-ace-ve-eval (QueryView REPEATED Defer))
+          (ve-ace-ve-eval (QueryView REPEATED Defer)))))
 
 
 (test-group "QueryView errors"
@@ -192,20 +206,22 @@
 
 (test-group "Nested views"
 
+  ;; ve-ace-ve-eval, not ve-ve-eval - see comment on the "QueryView" group above.
+
   (test "QueryView inside stored expression gets resolved"
-        '(Filter (Table (A 1 2 3)) (Greater A 1))
+        '(Table (A 2 3))
         (begin
-          (ve-ve-eval (DefineView INNER (Table (A 1 2 3))))
-          (ve-ve-eval (DefineView OUTER (Filter (QueryView INNER Defer) (Greater A 1))))
-          (ve-ve-eval (QueryView OUTER Defer))))
+          (ve-ace-ve-eval (DefineView INNER (Table (A 1 2 3))))
+          (ve-ace-ve-eval (DefineView OUTER (Filter (QueryView INNER Defer) (Greater A 1))))
+          (ve-ace-ve-eval (QueryView OUTER Defer))))
 
   (test "Three levels deep"
-        '(GroupBy (Filter (Table (A 1 2 3)) (Greater A 1)) (Sum A))
+        '(Table (|sum(A)| 5))
         (begin
-          (ve-ve-eval (DefineView LEVEL1 (Table (A 1 2 3))))
-          (ve-ve-eval (DefineView LEVEL2 (Filter (QueryView LEVEL1 Defer) (Greater A 1))))
-          (ve-ve-eval (DefineView LEVEL3 (GroupBy (QueryView LEVEL2 Defer) (Sum A))))
-          (ve-ve-eval (QueryView LEVEL3 Defer)))))
+          (ve-ace-ve-eval (DefineView LEVEL1 (Table (A 1 2 3))))
+          (ve-ace-ve-eval (DefineView LEVEL2 (Filter (QueryView LEVEL1 Defer) (Greater A 1))))
+          (ve-ace-ve-eval (DefineView LEVEL3 (GroupBy (QueryView LEVEL2 Defer) (Sum A))))
+          (ve-ace-ve-eval (QueryView LEVEL3 Defer)))))
 
 
 (test-group "Nested DefineView"
@@ -234,23 +250,25 @@
 
 (test-group "QueryView inside expressions"
 
+  ;; ve-ace-ve-eval, not ve-ve-eval - see comment on the "QueryView" group above.
+
   (test "QueryView as argument to Filter passes through resolved"
-        '(Filter (Table (A 1 2 3)) (Greater A 1))
+        '(Table (A 2 3))
         (begin
-          (ve-ve-eval (DefineView BASE (Table (A 1 2 3))))
-          (ve-ve-eval (Filter (QueryView BASE Defer) (Greater A 1)))))
+          (ve-ace-ve-eval (DefineView BASE (Table (A 1 2 3))))
+          (ve-ace-ve-eval (Filter (QueryView BASE Defer) (Greater A 1)))))
 
   (test "QueryView as argument to GroupBy passes through resolved"
-        '(GroupBy (Table (A 1 2 3)) (Sum A))
+        '(Table (|sum(A)| 6))
         (begin
-          (ve-ve-eval (DefineView BASE2 (Table (A 1 2 3))))
-          (ve-ve-eval (GroupBy (QueryView BASE2 Defer) (Sum A)))))
+          (ve-ace-ve-eval (DefineView BASE2 (Table (A 1 2 3))))
+          (ve-ace-ve-eval (GroupBy (QueryView BASE2 Defer) (Sum A)))))
 
   (test "QueryView as argument to Project passes through resolved"
-        '(Project (Table (A 1 2 3) (B 4 5 6)) A)
+        '(Table (A 1 2 3))
         (begin
-          (ve-ve-eval (DefineView BASE3 (Table (A 1 2 3) (B 4 5 6))))
-          (ve-ve-eval (Project (QueryView BASE3 Defer) A)))))
+          (ve-ace-ve-eval (DefineView BASE3 (Table (A 1 2 3) (B 4 5 6))))
+          (ve-ace-ve-eval (Project (QueryView BASE3 Defer) A)))))
 
 
 (test-group "Circular view detection"
@@ -731,31 +749,35 @@
 
   (ve-ve-eval (ClearViews))
 
+  ;; ve-ace-ve-eval, not ve-ve-eval - see comment on the "QueryView" group above.
+  ;; (vs_shadow below registers a lazy table but the same-named view always shadows
+  ;; it, so the query never actually reaches the table's fake Gather path.)
+
   (test "Bare view symbol resolves same as QueryView"
         '(Table (A 1 2 3))
         (begin
-          (ve-ve-eval (DefineView vs_simple (Table (A 1 2 3))))
-          (ve-ve-eval vs_simple)))
+          (ve-ace-ve-eval (DefineView vs_simple (Table (A 1 2 3))))
+          (ve-ace-ve-eval vs_simple)))
 
   (test "Bare view symbol with non-trivial definition resolves"
-        '(Filter (Table (A 1 2 3)) (Greater A 1))
+        '(Table (A 2 3))
         (begin
-          (ve-ve-eval (DefineView vs_filtered (Filter (Table (A 1 2 3)) (Greater A 1))))
-          (ve-ve-eval vs_filtered)))
+          (ve-ace-ve-eval (DefineView vs_filtered (Filter (Table (A 1 2 3)) (Greater A 1))))
+          (ve-ace-ve-eval vs_filtered)))
 
   (test "Bare view symbol as argument to outer expression"
-        '(Filter (Table (A 1 2 3)) (Greater A 1))
+        '(Table (A 2 3))
         (begin
-          (ve-ve-eval (DefineView vs_inner (Table (A 1 2 3))))
-          (ve-ve-eval (Filter vs_inner (Greater A 1)))))
+          (ve-ace-ve-eval (DefineView vs_inner (Table (A 1 2 3))))
+          (ve-ace-ve-eval (Filter vs_inner (Greater A 1)))))
 
   (test "View shadows same-named lazy table"
         '(Table (A 99))
         (begin
-          (ve-ve-eval (ClearTables))
-          (ve-ve-eval (RegisterTable vs_shadow "/data/vs_shadow.tbl" "/lib/loader.so" #t vs_shadow_col))
-          (ve-ve-eval (DefineView vs_shadow (Table (A 99))))
-          (ve-ve-eval vs_shadow)))
+          (ve-ace-ve-eval (ClearTables))
+          (ve-ace-ve-eval (RegisterTable vs_shadow "/data/vs_shadow.tbl" "/lib/loader.so" #t vs_shadow_col))
+          (ve-ace-ve-eval (DefineView vs_shadow (Table (A 99))))
+          (ve-ace-ve-eval vs_shadow)))
 
   (test "After DropView bare symbol passes through unchanged"
         'vs_dropped
@@ -774,9 +796,9 @@
   (test "Redefined view bare symbol reflects new definition"
         '(Table (A 99))
         (begin
-          (ve-ve-eval (DefineView vs_redef (Table (A 1 2 3))))
-          (ve-ve-eval (DefineView vs_redef (Table (A 99))))
-          (ve-ve-eval vs_redef))))
+          (ve-ace-ve-eval (DefineView vs_redef (Table (A 1 2 3))))
+          (ve-ace-ve-eval (DefineView vs_redef (Table (A 99))))
+          (ve-ace-ve-eval vs_redef))))
 
 
 (test-group "Column pruning"
@@ -816,7 +838,20 @@
         (begin
           (ve-eval (ClearTables))
           (ve-eval (RegisterTable cp5_tbl "/data/cp5.tbl" "/lib/loader.so" #f cp5_a cp5_b cp5_c))
-          (ve-eval (Project cp5_tbl cp5_a)))))
+          (ve-eval (Project cp5_tbl cp5_a))))
+
+  ;; --- Regression: a computed/aliased projection (As(expr, alias)) must gather the real base
+  ;; --- column(s) the expression references, and only those - not the operator names wrapping
+  ;; --- it (Year/Timestamp) and not the new alias name itself, since extractColumnsFromExpr's
+  ;; --- visitor only recurses into dynamic arguments, never a ComplexExpression's head. ---
+
+  (test "Computed alias expression gathers only its underlying base column, not operator names"
+        '(Project (Gather "/data/cp6.tbl" "/lib/loader.so" (Table) (List cp6_orderdate))
+                  (As (Year (Timestamp cp6_orderdate)) cp6_year))
+        (begin
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable cp6_tbl "/data/cp6.tbl" "/lib/loader.so" #t cp6_orderdate cp6_other))
+          (ve-eval (Project cp6_tbl (As (Year (Timestamp cp6_orderdate)) cp6_year))))))
 
 
 (test-group "Join canonicalisation - rewriter"
@@ -826,8 +861,13 @@
 
   ;; --- Side-swap canonicalisation for INNER joins ---
 
+  ;; A matched view's own definition is resolved by ACE alone (see the ve-ve-eval
+  ;; comment near the top of this file), so under this no-ACE pipeline it stays
+  ;; opaque as (CacheRef viewName Pending) - what these tests check is which view
+  ;; matched and what residual (if any) got built around that reference.
+
   (test "Inner join with swapped sides still matches view"
-        '(Join (ByName customers) (ByName orders) (Equal customer_id order_customer_id))
+        '(CacheRef CUSTOMER_ORDERS_VIEW Pending)
         (begin
           (ve-ve-eval (RegisterTable customers "/data/customers.tbl" "/lib/loader.so" #f customer_id customer_name))
           (ve-ve-eval (RegisterTable orders "/data/orders.tbl" "/lib/loader.so" #f order_id order_customer_id))
@@ -839,7 +879,7 @@
   ;; --- Predicate-pair order independence within a fixed side ---
 
   (test "Multi-predicate inner join matches regardless of predicate order"
-        '(Join (ByName shipments) (ByName containers) (Equal shipment_port container_port) (Equal shipment_date container_date))
+        '(CacheRef SHIPMENT_CONTAINER_VIEW Pending)
         (begin
           (ve-ve-eval (RegisterTable shipments "/data/shipments.tbl" "/lib/loader.so" #f shipment_port shipment_date))
           (ve-ve-eval (RegisterTable containers "/data/containers.tbl" "/lib/loader.so" #f container_port container_date))
@@ -851,7 +891,7 @@
   ;; --- Combined: both swapped sides AND swapped predicate order at once ---
 
   (test "Inner join matches with both sides and predicate order swapped"
-        '(Join (ByName employees) (ByName departments) (Equal employee_dept_x dept_x) (Equal employee_dept_y dept_y))
+        '(CacheRef EMPLOYEE_DEPT_VIEW Pending)
         (begin
           (ve-ve-eval (RegisterTable employees "/data/employees.tbl" "/lib/loader.so" #f employee_dept_x employee_dept_y))
           (ve-ve-eval (RegisterTable departments "/data/departments.tbl" "/lib/loader.so" #f dept_x dept_y))
@@ -882,8 +922,7 @@
   ;; --- View-on-view dependency chain, exercises recursive expandSignature/cache path ---
 
   (test "Inner join matches through a nested view dependency, sides and predicates reversed"
-        '(Join (Join (ByName customers) (ByName orders) (Equal customer_id order_customer_id))
-               (ByName payments) (Equal order_customer_id payment_customer_id))
+        '(CacheRef CUSTOMER_ORDERS_PAYMENTS_L2 Pending)
         (begin
           (ve-ve-eval (RegisterTable payments "/data/payments.tbl" "/lib/loader.so" #f payment_id payment_customer_id))
           (ve-ve-eval (DefineView CUSTOMER_ORDERS_L1
@@ -897,7 +936,7 @@
   ;; --- Mixed equi-join + residual (non-equi) predicate ---
 
   (test "Inner join with mixed equi + residual predicate matches regardless of predicate order"
-        '(Join (ByName products) (ByName returns) (Equal product_id return_product_id) (Greater product_price 5))
+        '(CacheRef PRODUCT_RETURNS_FILTERED_VIEW Pending)
         (begin
           (ve-ve-eval (DefineView PRODUCT_RETURNS_FILTERED_VIEW
               (Join products returns (Equal product_id return_product_id) (Greater product_price 5))))
@@ -915,9 +954,13 @@
   (ve-ve-eval (RegisterTable pr_returns "/data/pr_returns.tbl" "/lib/loader.so" #f
              pr_return_id pr_return_product_id))
 
+  ;; A matched view's own definition is resolved by ACE alone, so under this no-ACE
+  ;; pipeline it stays opaque as (CacheRef viewName Pending) - see the ve-ve-eval
+  ;; comment near the top of this file. What these tests check is the residual
+  ;; Filter/Project VE1 builds around that reference.
+
   (test "Predicate-only residual: extra Filter applied on top of resolved view"
-        '(Filter (Join (ByName pr_products) (ByName pr_returns) (Equal pr_product_id pr_return_product_id))
-                 (Greater pr_product_price 5))
+        '(Filter (CacheRef PR_JOIN_VIEW Pending) (Greater pr_product_price 5))
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView PR_JOIN_VIEW
@@ -927,10 +970,7 @@
               (Greater pr_product_price 5)))))
 
   (test "Projection-only residual: view over-projects, query narrows via residual Project"
-        '(Project
-          (Project (Join (ByName pr_products) (ByName pr_returns) (Equal pr_product_id pr_return_product_id))
-                    pr_product_id pr_product_name pr_product_price pr_return_id)
-          pr_product_id)
+        '(Project (CacheRef PR_WIDE_VIEW Pending) pr_product_id)
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView PR_WIDE_VIEW
@@ -941,10 +981,7 @@
               pr_product_id))))
 
   (test "Combined residual: Filter innermost, Project outermost, wrapping resolved view"
-        '(Project
-          (Filter (Join (ByName pr_products) (ByName pr_returns) (Equal pr_product_id pr_return_product_id))
-                  (Greater pr_product_price 5))
-          pr_product_id)
+        '(Project (Filter (CacheRef PR_PLAIN_VIEW Pending) (Greater pr_product_price 5)) pr_product_id)
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView PR_PLAIN_VIEW
@@ -988,12 +1025,15 @@
   (ve-ve-eval (RegisterTable dp_returns "/data/dp_returns.tbl" "/lib/loader.so" #f
              dp_return_id dp_return_product_id))
 
+  ;; A matched view's own definition is resolved by ACE alone, so under this no-ACE
+  ;; pipeline it stays opaque as (CacheRef viewName Pending) - see the ve-ve-eval
+  ;; comment near the top of this file. What these tests check is which view
+  ;; matched and what residual (if any) got built around that reference.
+
   ;; --- View domain strictly weaker than query domain: must match with residual ---
 
   (test "View with Greater(price,50) matches query needing Greater(price,100), residual added"
-        '(Filter (Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
-                          (Greater dp_product_price 50))
-                 (Greater dp_product_price 100))
+        '(Filter (CacheRef DP_WEAK_VIEW Pending) (Greater dp_product_price 100))
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView DP_WEAK_VIEW
@@ -1022,8 +1062,7 @@
   ;; --- Exact domain match: no residual should be added ---
 
   (test "View with exact same domain predicate as query needs no residual"
-        '(Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
-                 (Greater dp_product_price 50))
+        '(CacheRef DP_EXACT_VIEW Pending)
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView DP_EXACT_VIEW
@@ -1037,9 +1076,7 @@
   ;; --- Between covered by an equivalent view built from two comparisons ---
 
   (test "View with Greater+Less matches query needing a narrower Between"
-        '(Filter (Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
-                          (And (Greater dp_product_price 10) (Less dp_product_price 50)))
-                 (Between dp_product_price 20 30))
+        '(Filter (CacheRef DP_RANGE_VIEW Pending) (Between dp_product_price 20 30))
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView DP_RANGE_VIEW
@@ -1053,8 +1090,7 @@
   ;; --- Unrestricted view column vs query domain: usable but residual still needed ---
 
   (test "View unrestricted on price still needs residual Filter for query's Greater"
-        '(Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
-                 (Greater dp_product_price 5))
+        '(Filter (CacheRef DP_PLAIN_VIEW Pending) (Greater dp_product_price 5))
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView DP_PLAIN_VIEW
@@ -1066,9 +1102,7 @@
   ;; --- Single-column Or: real domain union, should match a subset request ---
 
   (test "View with Or on same column (union) matches a query needing a subset range"
-        '(Filter (Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
-                          (Or (Less dp_product_price 10) (Greater dp_product_price 5)))
-                 (Greater dp_product_price 5))
+        '(Filter (CacheRef DP_OR_VIEW Pending) (Greater dp_product_price 5))
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView DP_OR_VIEW
@@ -1082,8 +1116,7 @@
   ;; --- Cross-column Or: opaque fallback, only exact same expression should match ---
 
   (test "View with cross-column Or matches only exact same Or expression in query"
-        '(Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
-                 (Or (Greater dp_product_price 5) (Greater dp_return_id 10)))
+        '(CacheRef DP_CROSS_OR_VIEW Pending)
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView DP_CROSS_OR_VIEW
@@ -1110,8 +1143,7 @@
   ;; --- NotEqual: split-range domain ---
 
   (test "View with matching NotEqual needs no residual"
-        '(Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
-                 (NotEqual dp_product_price 5))
+        '(CacheRef DP_NOTEQUAL_VIEW Pending)
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView DP_NOTEQUAL_VIEW
@@ -1123,9 +1155,7 @@
               (NotEqual dp_product_price 5)))))
 
   (test "View with NotEqual(5) covers query needing Greater(10) via subset range, residual added"
-        '(Filter (Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
-                          (NotEqual dp_product_price 5))
-                 (Greater dp_product_price 10))
+        '(Filter (CacheRef DP_NOTEQUAL_VIEW2 Pending) (Greater dp_product_price 10))
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView DP_NOTEQUAL_VIEW2
@@ -1155,8 +1185,7 @@
   ;; --- Regression: exact base-table/join match but unrestricted domain column must still residual ---
 
   (test "Regression: unrestricted view on filtered column always produces residual, never bare QueryView"
-        '(Filter (Join (ByName dp_products) (ByName dp_returns) (Equal dp_product_id dp_return_product_id))
-                 (Greater dp_product_price 5))
+        '(Filter (CacheRef DP_REGRESSION_VIEW Pending) (Greater dp_product_price 5))
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView DP_REGRESSION_VIEW
@@ -1194,13 +1223,12 @@
   ;; --- stronger query predicate can be applied as a residual Filter, with a residual Project
   ;; --- on top to trim back down to what the query needs. ---
 
+  ;; A matched view's own definition is resolved by ACE alone, so under this no-ACE
+  ;; pipeline it stays opaque as (CacheRef viewName Pending) - see the ve-ve-eval
+  ;; comment near the top of this file.
+
   (test "View predicate weaker on a column still present in the projection is rewritable"
-        '(Project
-          (Filter
-            (Project (Filter (ByName cd_products) (Greater cd_product_price 50))
-                     cd_product_id cd_product_name cd_product_price)
-            (Greater cd_product_price 100))
-          cd_product_id)
+        '(Project (Filter (CacheRef CD_KEPT_VIEW Pending) (Greater cd_product_price 100)) cd_product_id)
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView CD_KEPT_VIEW
@@ -1236,12 +1264,12 @@
   ;; --- Control: same shape, but the view keeps the predicated column in its projection, so the
   ;; --- query's opaque predicate can be applied as a residual Filter. ---
 
+  ;; A matched view's own definition is resolved by ACE alone, so under this no-ACE
+  ;; pipeline it stays opaque as (CacheRef viewName Pending) - see the ve-ve-eval
+  ;; comment near the top of this file.
+
   (test "Query's opaque predicate on a column still present in the projection is rewritable"
-        '(Project
-          (Filter
-            (Project (ByName op_products) op_id op_name op_price)
-            (IsValid op_name))
-          op_id)
+        '(Project (Filter (CacheRef OP_KEPT_VIEW Pending) (IsValid op_name)) op_id)
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView OP_KEPT_VIEW
@@ -1274,8 +1302,12 @@
 
   ;; --- Control: same shape, but the view already performs the join - must rewrite. ---
 
+  ;; A matched view's own definition is resolved by ACE alone, so under this no-ACE
+  ;; pipeline it stays opaque as (CacheRef viewName Pending) - see the ve-ve-eval
+  ;; comment near the top of this file.
+
   (test "View covering both joined tables is rewritable"
-        '(Project (Join (ByName jp_a) (ByName jp_b) (Equal jp_a_id jp_b_id)) jp_a_id jp_a_val)
+        '(CacheRef JP_BOTH_VIEW Pending)
         (begin
           (ve-ve-eval (ClearViews))
           (ve-ve-eval (DefineView JP_BOTH_VIEW
@@ -1283,3 +1315,118 @@
           (ve-ve-eval (Project
               (Join jp_a jp_b (Equal jp_a_id jp_b_id))
               jp_a_id jp_a_val)))))
+
+
+(test-group "Domain partial credit reflects real interval tightness"
+
+  (ve-ve-eval (ClearViews))
+  (ve-ve-eval (ClearTables))
+
+  (ve-ve-eval (RegisterTable pc_lineitem "/data/pc_lineitem.tbl" "/lib/loader.so" #f
+             pc_l_orderkey pc_l_quantity pc_l_discount))
+
+  ;; --- Regression: a view with real (even if non-exact) predicates on every column the query
+  ;; --- filters on must beat a view that only predicates one of those columns and has no
+  ;; --- predicate at all on the other - "no predicate" must score strictly worse than "a real,
+  ;; --- if wide, predicate", and a tighter range must score better than a wider one. Before the
+  ;; --- fix these both scored identically (partial credit silently truncated to 0 via a size_t
+  ;; --- accumulator), producing ties broken by iteration order/cache status instead of which
+  ;; --- view actually does less residual filtering work. ---
+
+  ;; A matched view's own definition is resolved by ACE alone, so under this no-ACE
+  ;; pipeline it stays opaque as (CacheRef viewName Pending) - see the ve-ve-eval
+  ;; comment near the top of this file. What matters here is which view won.
+
+  (test "View with tighter, fuller predicates beats a view with a wide predicate and a gap"
+        '(Filter (CacheRef PC_TIGHT_VIEW Pending) (Between pc_l_quantity 15 20))
+        (begin
+          (ve-ve-eval (ClearViews))
+          (ve-ve-eval (DefineView PC_WIDE_VIEW
+              (Filter pc_lineitem (Between pc_l_quantity 1 50))))
+          (ve-ve-eval (DefineView PC_TIGHT_VIEW
+              (Filter pc_lineitem (And (Between pc_l_quantity 10 30) (Between pc_l_discount 2 4)))))
+          (ve-ve-eval (Filter pc_lineitem
+              (And (Between pc_l_quantity 15 20) (Between pc_l_discount 2 4)))))))
+
+
+(test-group "Opaque predicate on Project-aliased columns must not vanish from the signature"
+
+  (ve-ve-eval (ClearViews))
+  (ve-ve-eval (ClearTables))
+
+  (ve-ve-eval (RegisterTable eb_orders "/data/eb_orders.tbl" "/lib/loader.so" #f
+             eb_supp_nation eb_cust_nation eb_qty))
+
+  ;; --- Regression: an Or predicate spanning two Project-aliased columns (supp_nation/cust_nation
+  ;; --- come from As(...), not real registered table columns) must still be registered as an
+  ;; --- opaque predicate keyed by those alias symbols. Before the fix, extractColumnsFromExpr only
+  ;; --- recognised symbols already in columnRegistry (base-table schema columns), so the alias
+  ;; --- names came back empty, the whole Or predicate was silently dropped from the query's
+  ;; --- signature, and a view with no filter at all scored a perfect match - the filter vanished
+  ;; --- entirely from the rewritten query instead of surviving as a residual. ---
+
+  ;; A matched view's own definition is resolved by ACE alone, so under this no-ACE
+  ;; pipeline it stays opaque as (CacheRef viewName Pending) - see the ve-ve-eval
+  ;; comment near the top of this file. What matters here is that the Or predicate
+  ;; survives as a residual Filter instead of vanishing (i.e. instead of a bare,
+  ;; unwrapped CacheRef).
+
+  (test "Or predicate on aliased columns survives as a residual filter, not silently dropped"
+        '(Filter (CacheRef EB_DECOY_VIEW Pending)
+          (Or (And (Equal supp_nation 1) (Equal cust_nation 2))
+              (And (Equal supp_nation 2) (Equal cust_nation 1))))
+        (begin
+          (ve-ve-eval (ClearViews))
+          (ve-ve-eval (DefineView EB_DECOY_VIEW
+              (Project eb_orders eb_qty (As eb_supp_nation supp_nation) (As eb_cust_nation cust_nation))))
+          (ve-ve-eval (Filter
+              (Project eb_orders eb_qty (As eb_supp_nation supp_nation) (As eb_cust_nation cust_nation))
+              (Or (And (Equal supp_nation 1) (Equal cust_nation 2))
+                  (And (Equal supp_nation 2) (Equal cust_nation 1))))))))
+
+
+(test-group "intersectMerge null-pointer regression"
+
+  (ve-eval (ClearViews))
+  (ve-eval (ClearTables))
+
+  (ve-eval (RegisterTable nd_a "/data/nd_a.tbl" "/lib/loader.so" #f nd_id nd_val))
+  (ve-eval (RegisterTable nd_b "/data/nd_b.tbl" "/lib/loader.so" #f nd_id nd_other))
+
+  ;; --- Regression: a Join whose two branches both produce an output column with the same
+  ;; --- symbol (nd_id), where one side is a bare pass-through Project (nullptr in
+  ;; --- projectedColumns) and the other is an As(...) alias landing on that same symbol (a real
+  ;; --- pointer). intersectMerge used to dereference both sides unconditionally when comparing
+  ;; --- the two branches' projections for a conflict, segfaulting whenever either side was a bare
+  ;; --- pass-through. This doesn't even need a registered view - walking the query itself to
+  ;; --- build its signature was enough to crash the process. ---
+
+  (test "Join with a bare pass-through and an As(...) alias on the same output column doesn't crash"
+        '(Join (Project (ByName nd_a) nd_id) (Project (ByName nd_b) (As nd_id nd_id)) (Equal nd_id nd_id))
+        (ve-eval (Join
+            (Project nd_a nd_id)
+            (Project nd_b (As nd_id nd_id))
+            (Equal nd_id nd_id)))))
+
+
+(test-group "scoreView projection null/non-null mismatch"
+
+  (ve-ve-eval (ClearViews))
+  (ve-ve-eval (ClearTables))
+
+  (ve-ve-eval (RegisterTable pm_orders "/data/pm_orders.tbl" "/lib/loader.so" #f
+             pm_price pm_qty pm_revenue))
+
+  ;; --- Regression: a view that passes the base column pm_revenue straight through (nullptr in
+  ;; --- projectedColumns) must not be treated as satisfying a query that wants a column with the
+  ;; --- same name computed as price*qty (a real pointer in projectedColumns). The old check
+  ;; --- `it->second && queryExpr && ...` short-circuited to "no mismatch" whenever either side was
+  ;; --- null, so the raw base column silently stood in for the computed value. Must NOT rewrite. ---
+
+  (test "View's raw pass-through column does not satisfy a query needing it computed"
+        '(Project (ByName pm_orders) (As (Multiply pm_price pm_qty) pm_revenue))
+        (begin
+          (ve-ve-eval (ClearViews))
+          (ve-ve-eval (DefineView PM_DECOY_VIEW
+              (Project pm_orders pm_revenue)))
+          (ve-ve-eval (Project pm_orders (As (Multiply pm_price pm_qty) pm_revenue))))))
