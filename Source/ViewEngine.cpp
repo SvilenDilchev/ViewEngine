@@ -219,10 +219,21 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                       ComplexExpression("CacheRef"_, {}, std::move(cacheRefArgs), {}));
                 }
 
-                defaultCacheRegistry[viewName] = CacheEntry{
-                    std::move(viewCache[viewName]), CacheEntryType::Borrowed, integrityMode};
-                viewCacheOccupancy -= entry.size; // borrowed view is no longer occupying the cache
-                viewCache.erase(viewName);
+                // If it is a top-level QueryView and a cache hit, then the result is just the value
+                // of the cached view, and there is no further evaluation needed. Consequently, we
+                // can just mark the view as Borrowed (for consistency with non-top-level cache
+                // hits), but not move it out of the cache (set the value as a placeholder Symbol in
+                // this case) and then in the second pass of VE we can just clone the cached value
+                // as the return value or move it out of cache into the return value if it happens
+                // that the view gets evicted from cache.
+                Expression value = topLevel ? Expression(viewName) : std::move(viewCache[viewName]);
+                if (!topLevel) {
+                  viewCacheOccupancy -=
+                      entry.size; // borrowed view is no longer occupying the cache
+                  viewCache.erase(viewName);
+                }
+                defaultCacheRegistry[viewName] =
+                    CacheEntry{std::move(value), CacheEntryType::Borrowed, integrityMode};
 
                 return Expression(ComplexExpression("CacheRef"_, {}, std::move(cacheRefArgs), {}));
               }
@@ -268,6 +279,12 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                                                std::move(dynamics), std::move(spans))),
                   defaultCacheRegistry);
 
+              // If the query was a top-level QueryView call that was a cache hit, then the
+              // finalExpr is just the cache value of the view. If said view is being evicted,
+              // we can just move it out of the cache and into the final result.
+              // Otherwise, we just clone.
+              std::optional<boss::Symbol> inPlaceName;
+
               // Phase 1: Collect all execution measurements
               for (auto &[name, entry] : defaultCacheRegistry) {
                 auto it = viewRegistry.find(name);
@@ -275,67 +292,114 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                   throw std::runtime_error("View not found for caching in WithCaches: " +
                                            name.getName());
 
+                // View in registry and in cache --> top-level QueryView cache hit
+                if (viewCache.count(name)) {
+                  inPlaceName = name;
+                  continue;
+                }
+
                 storeIfPositive(it->second.computeCost, entry.computeCost);
                 storeIfPositive(it->second.materialiseCost, entry.materialiseCost);
+                // Reuse cost is only relevant when reusing a view's value to compute a new result,
+                // so should not be updated for a top-level QueryView cache hit
                 storeIfPositive(it->second.reuseCost, entry.reuseCost);
                 storeIfPositive(it->second.marginalComputeCost, entry.marginalComputeCost);
                 it->second.size = computeSize(entry.value);
               }
 
-              // Phase 2: Batch split - split this pass's candidates by decision
-              std::vector<AdmissionCandidate> tier1, tier2;
-              for (auto &[name, entry] : defaultCacheRegistry) {
-                auto &viewEntry = viewRegistry.at(name);
-                auto decision = viewEntry.cachingDecision;
-                viewEntry.cachingDecision = CachingDecision::Defer; // reset for next query
+              std::unordered_set<boss::Symbol> finalSet; // Views to remain/admit in cache
 
-                if (decision == CachingDecision::Reject)
-                  continue; // discard rejected views
+              // Skip the full admission process calculations if the top-level QueryView
+              // was a cache hit, it has been set to Reject, and the cache is not full
+              bool skipAdmissionProcess = false;
+              if (inPlaceName) {
+                auto &viewEntry = viewRegistry.at(*inPlaceName);
+                bool rejected = viewEntry.cachingDecision == CachingDecision::Reject;
+                double remainingOccupancy = viewCacheOccupancy - (rejected ? viewEntry.size : 0.0);
 
-                if (viewEntry.size <= 0.0)
-                  continue; // never materialised as Table_ (still symbolic);
-                            // don't admit unknown size views
-
-                // Fallback benefit to 0.0 if it cannot be computed, which shouldn't happen, but
-                // stay defensive, and use the true cost memo to avoid redundant computations
-                auto b = benefit(name, queryMetadata->trueCostMemo, true).value_or(0.0);
-
-                AdmissionCandidate candidate{name, viewEntry.size, b};
-                (decision == CachingDecision::Admit ? tier1 : tier2)
-                    .push_back(std::move(candidate));
-              }
-
-              // Presently cached views compete with Defer candidates for eviction
-              for (auto const &[cachedName, value] : viewCache) {
-                if (defaultCacheRegistry.count(cachedName))
-                  continue; // skip views that have already been processed in this pass
-
-                // Same as above
-                auto b = benefit(cachedName, queryMetadata->trueCostMemo, true).value_or(0.0);
-                tier2.push_back({cachedName, viewRegistry.at(cachedName).size, b});
-              }
-
-              // Sort tier1 and tier2 by benefit, descending
-              auto benefitComparator = [](AdmissionCandidate const &a,
-                                          AdmissionCandidate const &b) {
-                return a.benefit > b.benefit;
-              };
-              std::sort(tier1.begin(), tier1.end(), benefitComparator);
-              std::sort(tier2.begin(), tier2.end(), benefitComparator);
-
-              std::unordered_set<boss::Symbol> finalSet;
-              double usedSize = 0.0;
-
-              auto buildCacheFrom = [&](std::vector<AdmissionCandidate> const &candidates) {
-                for (auto const &candidate : candidates) {
-                  if (usedSize + candidate.size > viewCacheSize)
-                    continue; // skip and try potentially smaller candidates with lower benefit
-                  finalSet.insert(candidate.name);
-                  usedSize += candidate.size;
+                // If after evicting the top-level cache hit view, the cache occupancy is still
+                // larger than the cache size, we still have to go through admissions and evict
+                // more.
+                if (remainingOccupancy <= viewCacheSize) {
+                  skipAdmissionProcess = true;
+                  viewEntry.cachingDecision = CachingDecision::Defer;
+                  for (auto const &[name, value] : viewCache)
+                    finalSet.insert(name);
+                  if (rejected)
+                    finalSet.erase(*inPlaceName);
                 }
-              };
-              buildCacheFrom(tier1); // admit all user-admitted views first
-              buildCacheFrom(tier2); // then admit as many Defer views as possible
+              }
+
+              if (!skipAdmissionProcess) {
+                // Phase 2: Batch split - split this pass's candidates by decision
+                std::vector<AdmissionCandidate> tier1, tier2;
+                for (auto &[name, entry] : defaultCacheRegistry) {
+                  auto &viewEntry = viewRegistry.at(name);
+                  auto decision = viewEntry.cachingDecision;
+                  viewEntry.cachingDecision = CachingDecision::Defer; // reset for next query
+
+                  if (decision == CachingDecision::Reject)
+                    continue; // discard rejected views
+
+                  if (viewEntry.size <= 0.0)
+                    continue; // never materialised as Table_ (still symbolic);
+                              // don't admit unknown size views
+
+                  // Fallback benefit to 0.0 if it cannot be computed, which shouldn't happen, but
+                  // stay defensive, and use the true cost memo to avoid redundant computations
+                  auto b = benefit(name, queryMetadata->trueCostMemo, true).value_or(0.0);
+
+                  AdmissionCandidate candidate{name, viewEntry.size, b};
+                  (decision == CachingDecision::Admit ? tier1 : tier2)
+                      .push_back(std::move(candidate));
+                }
+
+                // Presently cached views compete with Defer candidates for eviction
+                for (auto const &[cachedName, value] : viewCache) {
+                  if (defaultCacheRegistry.count(cachedName))
+                    continue; // skip views that have already been processed in this pass
+
+                  // Same as above
+                  auto b = benefit(cachedName, queryMetadata->trueCostMemo, true).value_or(0.0);
+                  tier2.push_back({cachedName, viewRegistry.at(cachedName).size, b});
+                }
+
+                // Sort tier1 and tier2 by benefit, descending
+                auto benefitComparator = [](AdmissionCandidate const &a,
+                                            AdmissionCandidate const &b) {
+                  return a.benefit > b.benefit;
+                };
+                std::sort(tier1.begin(), tier1.end(), benefitComparator);
+                std::sort(tier2.begin(), tier2.end(), benefitComparator);
+
+                double usedSize = 0.0;
+
+                auto buildCacheFrom = [&](std::vector<AdmissionCandidate> const &candidates) {
+                  for (auto const &candidate : candidates) {
+                    if (usedSize + candidate.size > viewCacheSize)
+                      continue; // skip and try potentially smaller candidates with lower benefit
+                    finalSet.insert(candidate.name);
+                    usedSize += candidate.size;
+                  }
+                };
+                buildCacheFrom(tier1); // admit all user-admitted views first
+                buildCacheFrom(tier2); // then admit as many Defer views as possible
+              }
+
+              // Final result should be a materialised "Table"_ from ACE or a cached view
+              Expression result;
+              if (inPlaceName) {
+                // If we have a top-level QueryView cache hit and it is being evicted, we move it
+                // out of the cache and into the result, otherwise we clone it
+                result =
+                    finalSet.count(*inPlaceName)
+                        ? viewCache.at(*inPlaceName).clone(CloneReason::EVALUATE_CONST_EXPRESSION)
+                        : std::move(viewCache.at(*inPlaceName));
+              } else {
+                // If no top-level QueryView cache hit, the final result is just the ACE evaluated
+                // expression
+                result = std::move(finalExpr);
+              }
 
               // Phase 3: Evict all views not in the final set, and admit new views that made it
               for (auto it = viewCache.begin(); it != viewCache.end();) {
@@ -347,15 +411,13 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 }
               }
               for (auto &[name, entry] : defaultCacheRegistry) {
+                if (inPlaceName && name == *inPlaceName)
+                  continue; // Skip the top-level QueryView cache hit view
                 if (finalSet.count(name)) {
                   viewCache[name] = std::move(entry.value);
                   viewCacheOccupancy += viewRegistry.at(name).size;
                 }
               }
-
-              // Final result should be a materialised "Table"_ from ACE
-              auto *finalCE = std::get_if<ComplexExpression>(&finalExpr);
-              Expression result = std::move(finalExpr);
 
               defaultCacheRegistry.clear();
               return result;
@@ -581,7 +643,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
             return Expression(ComplexExpression(std::move(head), std::move(statics),
                                                 std::move(dynamics), std::move(spans)));
           },
-          [queryMetadata, flatten](Symbol &&s) -> Expression {
+          [queryMetadata, flatten, topLevel](Symbol &&s) -> Expression {
             auto viewIt = viewRegistry.find(s);
             if (viewIt != viewRegistry.end()) {
               boss::ExpressionArguments queryViewArgs;
@@ -598,7 +660,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
 
               auto rewritten =
                   Expression(ComplexExpression("QueryView"_, {}, std::move(queryViewArgs), {}));
-              return evaluate(std::move(rewritten), queryMetadata, true, flatten);
+              return evaluate(std::move(rewritten), queryMetadata, true, flatten, topLevel);
             }
 
             auto tableIt = tableRegistry.find(s);
