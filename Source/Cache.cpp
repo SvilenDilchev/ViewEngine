@@ -103,10 +103,18 @@ double computeSize(Expression const &tableExpr) {
     return 0.0; // Not a table expression, size is 0, cannot be admitted to the cache
 
   double total = 0.0;
-  for (auto const &colExpr : ce->getDynamicArguments())
-    if (auto const *col = std::get_if<ComplexExpression>(&colExpr))
-      total += col->getDynamicArguments().empty() ? sizeOfColumnSpans(col->getSpanArguments())
-                                                   : sizeOfColumn(col->getDynamicArguments());
+  for (auto const &colExpr : ce->getDynamicArguments()) {
+    auto const *col = std::get_if<ComplexExpression>(&colExpr);
+    if (!col)
+      continue;
+    // Unwrap Date column
+    if (col->getHead() == "Date"_ && col->getDynamicArguments().size() == 1)
+      col = std::get_if<ComplexExpression>(&col->getDynamicArguments()[0]);
+    if (!col)
+      continue;
+    total += col->getDynamicArguments().empty() ? sizeOfColumnSpans(col->getSpanArguments())
+                                                : sizeOfColumn(col->getDynamicArguments());
+  }
 
   return total;
 }
