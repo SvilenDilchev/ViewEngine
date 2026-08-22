@@ -1,6 +1,7 @@
 #include "ViewRegistry.hpp"
 #include "Cache.hpp"
 
+EngineMode engineMode = EngineMode::Full;
 std::unordered_map<boss::Symbol, ViewEntry> viewRegistry;
 std::unordered_set<boss::Symbol> evaluationStack;
 std::unordered_set<boss::Symbol> resolvedCacheRefs;

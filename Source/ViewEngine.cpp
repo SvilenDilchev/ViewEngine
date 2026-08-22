@@ -631,10 +631,34 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               return Expression(true);
             }
 
+            if (head == "SetEngineMode"_) {
+              if (!topLevel)
+                return Expression(false);
+
+              if (dynamics.size() != 1)
+                return Expression(false); // SetEngineMode requires exactly 1 argument: Lite or Full
+
+              auto *mode = std::get_if<Symbol>(&dynamics[0]);
+              if (!mode)
+                return Expression(false);
+
+              if (*mode == "Lite"_)
+                engineMode = EngineMode::Lite;
+              else if (*mode == "Full"_)
+                engineMode = EngineMode::Full;
+              else
+                return Expression(false);
+
+              return Expression(true);
+            }
+
             // Recursively evaluate arguments of other expressions
-            // Do not eval args to preserve definitions for output
-            // Check is here to block eval on second pass through ViewEngine in pipeline
-            if (head != "ViewList"_ && head != "TableList"_ && head != "ByName"_) {
+            // - Do not eval args of ViewList or TableList to preserve definitions for output
+            // - Do not eval args of ByName to avoid symbol handler replacement leading to
+            //   ByName(ByName(actualName))
+            // - Do not eval args of Table_ for performance reasons
+            if (head != "ViewList"_ && head != "TableList"_ && head != "ByName"_ &&
+                head != "Table"_) {
               for (auto &arg : dynamics) {
                 arg = evaluate(std::move(arg), queryMetadata, skipRewrite, flatten);
               }
@@ -677,7 +701,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
             }
 
             boss::ExpressionArguments colArgs;
-            if (!queryMetadata->referencedColumns.empty() &&
+            if (queryMetadata && !queryMetadata->referencedColumns.empty() &&
                 !queryMetadata->signature.projectedColumns.empty()) {
               for (auto const &col : entry.columns)
                 if (queryMetadata->referencedColumns.count(col))
@@ -700,6 +724,14 @@ extern "C" BOSSExpression *evaluate(BOSSExpression *e) {
   defaultCacheRegistry.clear();
   resolvedCacheRefs.clear();
   ++veTick;
+
+  if (engineMode == EngineMode::Lite) {
+    // skipRewrite + flatten: no rewriting, no caching - QueryView and bare-symbol
+    // view references just substitute the stored definition, recursively.
+    auto result = evaluate(std::move(e->delegate), nullptr, true, true, true);
+    return new BOSSExpression{.delegate = std::move(result)};
+  }
+
   auto result = evaluate(std::move(e->delegate), nullptr, false, false, true);
 
   if (defaultCacheRegistry.empty())

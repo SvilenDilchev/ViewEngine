@@ -1430,3 +1430,135 @@
           (ve-ve-eval (DefineView PM_DECOY_VIEW
               (Project pm_orders pm_revenue)))
           (ve-ve-eval (Project pm_orders (As (Multiply pm_price pm_qty) pm_revenue))))))
+
+
+(test-group "Lite mode (SetEngineMode)"
+
+  ;; Lite mode bypasses both the query rewriter (findRewriting) and the cache (viewCache /
+  ;; WithCaches / CacheRef): QueryView and bare-symbol view references just substitute the
+  ;; stored definition, recursively, with nothing cached and no rewrite candidates searched
+  ;; for. Because no CacheRef/WithCaches wrapper is ever produced in this mode, a single VE
+  ;; pass with no ACE is enough to see the fully-substituted result - contrast with Full
+  ;; mode's ve-ve-eval/ve-ace-ve-eval requirement (see the comment near the top of this file).
+
+  (ve-eval (ClearViews))
+  (ve-eval (ClearTables))
+  (ve-eval (SetEngineMode Full)) ;; ensure a known starting mode
+
+  (test "SetEngineMode Lite returns true"
+        #t
+        (ve-eval (SetEngineMode Lite)))
+
+  (test "SetEngineMode Full returns true"
+        #t
+        (ve-eval (SetEngineMode Full)))
+
+  (test "SetEngineMode with unknown symbol returns false"
+        #f
+        (ve-eval (SetEngineMode Bogus)))
+
+  (test "SetEngineMode with no arguments returns false"
+        #f
+        (ve-eval (SetEngineMode)))
+
+  (test "SetEngineMode with too many arguments returns false"
+        #f
+        (ve-eval (SetEngineMode Lite Full)))
+
+  (test "SetEngineMode with non-symbol argument returns false"
+        #f
+        (ve-eval (SetEngineMode 123)))
+
+  (test "SetEngineMode not at top level returns false"
+        '(TestWrapper #f)
+        (ve-eval (TestWrapper (SetEngineMode Lite))))
+
+  (test "QueryView fully substitutes in a single VE pass in Lite mode"
+        '(Table (A 1 2 3))
+        (begin
+          (ve-eval (SetEngineMode Lite))
+          (ve-eval (DefineView LM_SIMPLE (Table (A 1 2 3))))
+          (ve-eval (QueryView LM_SIMPLE))))
+
+  (test "QueryView with legacy caching-decision argument is accepted and ignored in Lite mode"
+        '(Table (A 1 2 3))
+        (begin
+          (ve-eval (SetEngineMode Lite))
+          (ve-eval (DefineView LM_LEGACY (Table (A 1 2 3))))
+          (ve-eval (QueryView LM_LEGACY Admit Standard Content))))
+
+  (test "Bare view symbol substitutes directly with no rewrite metadata needed"
+        '(Filter (Table (A 1 2 3)) (Greater A 1))
+        (begin
+          (ve-eval (SetEngineMode Lite))
+          (ve-eval (DefineView LM_BARE (Table (A 1 2 3))))
+          (ve-eval (Filter LM_BARE (Greater A 1)))))
+
+  (test "Nested view-on-view substitution fully resolves in a single VE pass"
+        '(GroupBy (Filter (Table (A 1 2 3)) (Greater A 1)) (Sum A))
+        (begin
+          (ve-eval (SetEngineMode Lite))
+          (ve-eval (DefineView LM_INNER (Table (A 1 2 3))))
+          (ve-eval (DefineView LM_OUTER (Filter (QueryView LM_INNER Defer) (Greater A 1))))
+          (ve-eval (GroupBy (QueryView LM_OUTER) (Sum A)))))
+
+  ;; No query rewriter in Lite mode: a freshly-issued query is never rewritten into a
+  ;; reference to an existing view, even when its shape matches one exactly.
+  (test "Matching query shape is not rewritten to an existing view in Lite mode"
+        '(Filter (ByName lm_rw_tbl) (Greater lm_rw_col 5))
+        (begin
+          (ve-eval (SetEngineMode Lite))
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable lm_rw_tbl "/data/lm_rw.tbl" "/lib/loader.so" #f lm_rw_col))
+          (ve-eval (DefineView LM_RW_VIEW (Filter lm_rw_tbl (Greater lm_rw_col 5))))
+          (ve-eval (Filter lm_rw_tbl (Greater lm_rw_col 5)))))
+
+  ;; No caching in Lite mode: querying the same view twice re-substitutes the definition
+  ;; fresh each time instead of reusing/borrowing a cached value.
+  (test "Repeated QueryView of the same view in Lite mode re-substitutes rather than caching"
+        '(Table (A 1 2 3))
+        (begin
+          (ve-eval (SetEngineMode Lite))
+          (ve-eval (DefineView LM_REPEAT (Table (A 1 2 3))))
+          (ve-eval (QueryView LM_REPEAT))
+          (ve-eval (QueryView LM_REPEAT))))
+
+  ;; Table resolution (lazy -> Gather, eager -> ByName) is unaffected by Lite mode; the only
+  ;; difference is column pruning doesn't apply since there's no rewriter-built signature to
+  ;; prune with, so Gather requests all columns (empty List).
+  (test "Lazy table symbol still resolves to Gather in Lite mode without column pruning"
+        '(Project (Gather "/data/lm_lazy.tbl" "/lib/loader.so" (Table) (List)) lm_lazy_col)
+        (begin
+          (ve-eval (SetEngineMode Lite))
+          (ve-eval (ClearTables))
+          (ve-eval (RegisterTable lm_lazy_tbl "/data/lm_lazy.tbl" "/lib/loader.so" #t lm_lazy_col))
+          (ve-eval (Project lm_lazy_tbl lm_lazy_col))))
+
+  ;; DefineView bookkeeping (dependency graph, cycle detection) is registry integrity, not
+  ;; part of the rewriter or the cache, so it stays active in Lite mode too.
+  (test "Cycle detection still blocks a cyclic DefineView in Lite mode"
+        #f
+        (begin
+          (ve-eval (SetEngineMode Lite))
+          (ve-eval (DefineView LM_CYCA (QueryView LM_CYCB Defer)))
+          (ve-eval (DefineView LM_CYCB (QueryView LM_CYCA Defer)))))
+
+  (test "QueryView on unknown view still throws in Lite mode"
+        '(ErrorWhenEvaluatingExpression (||) "View not found: LM_NONEXISTENT")
+        (begin
+          (ve-eval (SetEngineMode Lite))
+          (ve-eval (QueryView LM_NONEXISTENT))))
+
+  ;; Full mode's caching/rewriting resumes exactly as before once switched back - a fresh
+  ;; cache-miss QueryView opaquely returns CacheRef, same as any other Full-mode test (see
+  ;; the ve-ve-eval comment near the top of this file).
+  (test "Switching back to Full mode restores caching/rewriting via CacheRef"
+        '(CacheRef LM_BACKTOFULL Pending)
+        (begin
+          (ve-ve-eval (SetEngineMode Lite))
+          (ve-ve-eval (ClearViews))
+          (ve-ve-eval (DefineView LM_BACKTOFULL (Table (A 1 2 3))))
+          (ve-ve-eval (SetEngineMode Full))
+          (ve-ve-eval (QueryView LM_BACKTOFULL Defer))))
+
+  (ve-eval (SetEngineMode Full))) ;; leave the engine in its default mode for any tests that follow

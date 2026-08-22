@@ -27,6 +27,14 @@ struct ViewEntry {
   CachingDecision cachingDecision = CachingDecision::Defer; // Whether the view should be cached
 };
 
+// Full: query rewriter (findRewriting) and caching (viewCache/WithCaches) are active as normal.
+// Lite: both are bypassed - QueryView/bare-symbol view references are resolved by directly
+// substituting the stored definition (recursively), nothing is cached, and no rewrite candidates
+// are searched for. DefineView bookkeeping (dependency graph, cycle detection) is unaffected by
+// this mode, since it's registry integrity, not rewriting or caching.
+enum class EngineMode { Full, Lite };
+extern EngineMode engineMode;
+
 extern std::unordered_map<boss::Symbol, ViewEntry> viewRegistry; // In memory register of Views
 extern std::unordered_set<boss::Symbol> evaluationStack;         // Guard against runtime cycles
 extern std::unordered_set<boss::Symbol>
