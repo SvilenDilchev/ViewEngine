@@ -1425,17 +1425,15 @@ std::optional<boss::ExpressionArguments> computeResidualProjection(const Signatu
 }
 
 // Returns true if `candidate` should replace current `best`.
-static bool
-candidateViewRewriteComparator(boss::Symbol const &bestName, double bestScore,
-                               boss::Symbol const &candName, double candScore,
-                               std::unordered_map<boss::Symbol, std::optional<double>> &memo) {
+static bool candidateViewRewriteComparator(boss::Symbol const &bestName, double bestScore,
+                                           std::optional<double> bestCost,
+                                           boss::Symbol const &candName, double candScore,
+                                           std::optional<double> candCost) {
   bool cachedBest = viewCache.count(bestName) > 0;
   bool cachedCand = viewCache.count(candName) > 0;
 
-  auto costBest = trueCost(bestName, memo, true);
-  auto costCand = trueCost(candName, memo, true);
-  bool hasCostBest = costBest.has_value();
-  bool hasCostCand = costCand.has_value();
+  bool hasCostBest = bestCost.has_value();
+  bool hasCostCand = candCost.has_value();
 
   if (!cachedBest && !cachedCand) {
     if (!hasCostBest && !hasCostCand)
@@ -1458,8 +1456,8 @@ candidateViewRewriteComparator(boss::Symbol const &bestName, double bestScore,
   // select the cheaper one
   auto &bestEntry = viewRegistry.at(bestName);
   auto &candEntry = viewRegistry.at(candName);
-  double effBest = cachedBest ? bestEntry.reuseCost : *costBest;
-  double effCand = cachedCand ? candEntry.reuseCost : *costCand;
+  double effBest = cachedBest ? bestEntry.reuseCost : *bestCost;
+  double effCand = cachedCand ? candEntry.reuseCost : *candCost;
   return effCand < effBest; // same cached status: lower effective cost wins
 }
 
@@ -1502,6 +1500,7 @@ std::optional<Expression> findRewriting(const Expression &query, ViewMetadata &q
 
   std::optional<ViewMetadata> bestMatch;
   std::optional<boss::Symbol> bestName;
+  std::optional<double> bestCost;
   double bestScore = -1.0;
 
   for (const auto &name : candidateViewsForTables(queryMetadata.signature.baseTables)) {
@@ -1523,7 +1522,7 @@ std::optional<Expression> findRewriting(const Expression &query, ViewMetadata &q
       boss::ExpressionArguments args;
       args.push_back(Symbol(name));
       args.push_back("Defer"_);
-      auto strategy = selectExecutionStrategy(entry, queryMetadata.trueCostMemo);
+      auto strategy = selectExecutionStrategy(entry);
       args.push_back(strategy == ExecutionStrategy::IsolatedMeasurement ? "IsolatedMeasurement"_
                                                                         : "Standard"_);
       Expression queryView = ComplexExpression("QueryView"_, {}, std::move(args), {});
@@ -1533,11 +1532,13 @@ std::optional<Expression> findRewriting(const Expression &query, ViewMetadata &q
     if (score <= -1.0)
       continue; // outright reject
 
-    if (!bestName || candidateViewRewriteComparator(*bestName, bestScore, name, score,
-                                                    queryMetadata.trueCostMemo)) {
+    auto candCost = trueCost(name, true);
+    if (!bestName ||
+        candidateViewRewriteComparator(*bestName, bestScore, bestCost, name, score, candCost)) {
       bestName = name;
       bestScore = score;
       bestMatch = std::move(viewMeta);
+      bestCost = candCost;
     }
   }
 
@@ -1547,7 +1548,7 @@ std::optional<Expression> findRewriting(const Expression &query, ViewMetadata &q
     boss::ExpressionArguments args;
     args.push_back(Symbol(*bestName));
     args.push_back("Defer"_);
-    auto strategy = selectExecutionStrategy(viewRegistry.at(*bestName), queryMetadata.trueCostMemo);
+    auto strategy = selectExecutionStrategy(viewRegistry.at(*bestName));
     args.push_back(strategy == ExecutionStrategy::IsolatedMeasurement ? "IsolatedMeasurement"_
                                                                       : "Standard"_);
     Expression rewritten = ComplexExpression("QueryView"_, {}, std::move(args), {});

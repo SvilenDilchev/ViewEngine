@@ -2,6 +2,7 @@
 #include <Expression.hpp>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 
 std::unordered_map<Symbol, Expression> viewCache;
 double viewCacheSize = 1e9; // 1 GB default limit
@@ -107,6 +108,16 @@ double computeSize(Expression const &tableExpr) {
     auto const *col = std::get_if<ComplexExpression>(&colExpr);
     if (!col)
       continue;
+    // Unwrap Nullable(<column>, Nulls(Span<int64>[off,len,...])). ACE wraps this
+    // OUTSIDE Date(...), so it comes off first. The run table is real cached bytes,
+    // so it counts towards the column's size.
+    if (col->getHead() == "Nullable"_ && col->getDynamicArguments().size() == 2) {
+      if (auto const *nulls = std::get_if<ComplexExpression>(&col->getDynamicArguments()[1]))
+        total += sizeOfColumnSpans(nulls->getSpanArguments());
+      col = std::get_if<ComplexExpression>(&col->getDynamicArguments()[0]);
+      if (!col)
+        continue;
+    }
     // Unwrap Date column
     if (col->getHead() == "Date"_ && col->getDynamicArguments().size() == 1)
       col = std::get_if<ComplexExpression>(&col->getDynamicArguments()[0]);
@@ -133,26 +144,31 @@ std::optional<double> isoCost(ViewEntry const &entry) {
   return entry.computeCost + entry.materialiseCost;
 }
 
-std::optional<double> stdCost(ViewEntry const &entry,
-                              std::unordered_map<boss::Symbol, std::optional<double>> &memo,
-                              bool fallbackToIso) {
+std::optional<double> stdCost(ViewEntry const &entry, bool fallbackToIso,
+                              std::unordered_set<boss::Symbol> *visited) {
   if (!hasStdInfo(entry))
     return std::nullopt; // parent true cost will handle fallback to iso
 
-  double total = entry.marginalComputeCost;
+  std::unordered_set<boss::Symbol> localVisited;
+  auto &visitedSet = visited ? *visited : localVisited;
+
+  double total = entry.marginalComputeCost + entry.materialiseCost;
   for (auto const &dep : entry.dependencies) {
     auto it = viewRegistry.find(dep);
     if (it == viewRegistry.end())
       return std::nullopt; // Shouldn't happen in practice
 
     auto const &depEntry = it->second;
-    if (viewCache.find(dep) != viewCache.end()) {
-      // TODO: in the scope of the project as we know the actual reuse cost is close enough to zero,
-      // it doesn't matter if we know the value or it's unknown (0.0 default), so it's fine to not
-      // handle the case where the reuse cost is unknown.
-      total += depEntry.reuseCost;
+    if (viewCache.count(dep)) {
+      if (depEntry.reuseCost <= 0.0)
+        return std::nullopt; // View has been cached but never reused, so reuse cost is unknown, the
+                             // selection of the execution strategy doesn't actually matter because
+                             // we will be using the cached value, and the reuse cost will be
+                             // measured for future runs.
+      if (visitedSet.insert(dep).second)
+        total += depEntry.reuseCost;
     } else {
-      auto depCost = trueCost(dep, memo, fallbackToIso);
+      auto depCost = trueCost(dep, fallbackToIso, &visitedSet);
       if (!depCost)
         return std::nullopt; // Missing info anywhere down the chain, shouldn't happen if
                              // fallbackToIso is true, but we don't want to crash if it does.
@@ -163,36 +179,31 @@ std::optional<double> stdCost(ViewEntry const &entry,
   return total;
 }
 
-std::optional<double> trueCost(boss::Symbol const &name,
-                               std::unordered_map<boss::Symbol, std::optional<double>> &memo,
-                               bool fallbackToIso) {
-  if (auto it = memo.find(name); it != memo.end())
-    return it->second;
-
+std::optional<double> trueCost(boss::Symbol const &name, bool fallbackToIso,
+                               std::unordered_set<boss::Symbol> *visited) {
   auto it = viewRegistry.find(name);
   if (it == viewRegistry.end())
     return std::nullopt; // Shouldn't happen in practice
 
+  std::unordered_set<boss::Symbol> localVisited;
+  auto &visitedSet = visited ? *visited : localVisited;
+  if (!visitedSet.insert(name).second)
+    return 0.0; // Already visited, don't add the cost again, in ACE if a view is used multiple
+                // times in a query, it's computed only once then reused, so we don't want to
+                // double-count its cost.
+
   auto const &entry = it->second;
   auto iso = isoCost(entry);
-  auto std_ = stdCost(entry, memo, fallbackToIso);
+  auto std_ = stdCost(entry, fallbackToIso, &visitedSet);
 
-  std::optional<double> result;
   if (iso && std_)
-    result = std::min(*iso, *std_);
+    return std::min(*iso, *std_);
   else if (iso && fallbackToIso)
-    result = iso;
-  else
-    result = std_;
-
-  memo[name] = result;
-
-  return result;
+    return iso;
+  return std_;
 }
 
-std::optional<double> benefit(boss::Symbol const &name,
-                              std::unordered_map<boss::Symbol, std::optional<double>> &memo,
-                              bool fallbackToIso) {
+std::optional<double> benefit(boss::Symbol const &name, bool fallbackToIso) {
   auto it = viewRegistry.find(name);
   if (it == viewRegistry.end())
     return std::nullopt; // Shouldn't happen in practice
@@ -201,7 +212,7 @@ std::optional<double> benefit(boss::Symbol const &name,
   if (entry.size <= 0.0)
     return std::nullopt;
 
-  auto cost = trueCost(name, memo, fallbackToIso);
+  auto cost = trueCost(name, fallbackToIso);
   if (!cost)
     return std::nullopt;
 
@@ -209,9 +220,7 @@ std::optional<double> benefit(boss::Symbol const &name,
   return savings * entry.importanceFactor / entry.size;
 }
 
-ExecutionStrategy
-selectExecutionStrategy(ViewEntry &entry,
-                        std::unordered_map<boss::Symbol, std::optional<double>> &memo) {
+ExecutionStrategy selectExecutionStrategy(ViewEntry &entry) {
   auto iso = isoCost(entry);
   if (!iso) {
     // Run isolated measurement to get instrumentation info and defer the caching decision to VE2
@@ -219,8 +228,7 @@ selectExecutionStrategy(ViewEntry &entry,
     return ExecutionStrategy::IsolatedMeasurement;
   }
 
-  // Memoise true cost computations for this pass to avoid redundant calculations
-  auto std_ = stdCost(entry, memo);
+  auto std_ = stdCost(entry);
   if (!std_) {
     // Run standard execution to get instrumentation info and defer the caching decision to VE2
     // where we have more information.

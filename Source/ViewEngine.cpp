@@ -120,8 +120,8 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
             }
 
             if (head == "QueryView"_) {
-              if (dynamics.size() < 1 || dynamics.size() > 4)
-                throw std::runtime_error("QueryView requires 1 to 4 arguments");
+              if (dynamics.size() < 1 || dynamics.size() > 3)
+                throw std::runtime_error("QueryView requires 1 to 3 arguments");
 
               auto *name = std::get_if<Symbol>(&dynamics[0]);
               if (!name)
@@ -159,7 +159,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                     "QueryView second argument must be a symbol: Admit, Reject, or Defer");
 
               std::optional<ExecutionStrategy> forcedStrategy = std::nullopt;
-              if (dynamics.size() >= 3) {
+              if (dynamics.size() == 3) {
                 auto *strat = std::get_if<Symbol>(&dynamics[2]);
                 if (!strat)
                   throw std::runtime_error("QueryView third argument must be a symbol");
@@ -167,16 +167,6 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 if (!forcedStrategy)
                   throw std::runtime_error("QueryView unknown execution strategy: " +
                                            strat->getName());
-              }
-
-              std::optional<IntegrityCheckMode> integrityMode = std::nullopt;
-              if (dynamics.size() == 4) {
-                auto *mode = std::get_if<Symbol>(&dynamics[3]);
-                if (!mode)
-                  throw std::runtime_error("QueryView fourth argument must be a symbol");
-                integrityMode = symbolToIntegrityCheckMode(*mode);
-                if (!integrityMode)
-                  throw std::runtime_error("QueryView unknown integrity mode: " + mode->getName());
               }
 
               if (queryMetadata && queryMetadata->creditAwarded) {
@@ -233,7 +223,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                   viewCache.erase(viewName);
                 }
                 defaultCacheRegistry[viewName] =
-                    CacheEntry{std::move(value), CacheEntryType::Borrowed, integrityMode};
+                    CacheEntry{std::move(value), CacheEntryType::Borrowed};
 
                 return Expression(ComplexExpression("CacheRef"_, {}, std::move(cacheRefArgs), {}));
               }
@@ -258,7 +248,6 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 defaultCacheRegistry[viewName] = CacheEntry{
                     std::move(entryValue),
                     CacheEntryType::Pending,
-                    integrityMode,
                     strategy,
                 };
               }
@@ -345,9 +334,15 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                     continue; // never materialised as Table_ (still symbolic);
                               // don't admit unknown size views
 
-                  // Fallback benefit to 0.0 if it cannot be computed, which shouldn't happen, but
-                  // stay defensive, and use the true cost memo to avoid redundant computations
-                  auto b = benefit(name, queryMetadata->trueCostMemo, true).value_or(0.0);
+                  // Fallback benefit to 0.0 if it cannot be computed, which shouldn't happen,
+                  // but stay defensive
+                  auto b = benefit(name, true).value_or(0.0);
+
+                  // If both compute and reuse costs are known, and the reuse cost is somehow more
+                  // expensive, it will result in a negative benefit score, which means that the
+                  // view is not worth caching, so we skip it.
+                  if (decision != CachingDecision::Admit && b < 0.0)
+                    continue;
 
                   AdmissionCandidate candidate{name, viewEntry.size, b};
                   (decision == CachingDecision::Admit ? tier1 : tier2)
@@ -359,8 +354,13 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                   if (defaultCacheRegistry.count(cachedName))
                     continue; // skip views that have already been processed in this pass
 
-                  // Same as above
-                  auto b = benefit(cachedName, queryMetadata->trueCostMemo, true).value_or(0.0);
+                  auto b = benefit(cachedName, true).value_or(0.0);
+
+                  // A view that was admitted in a previous query (due to an unknown reuse cost)
+                  // that is now known to be more expensive to reuse than to recompute will have a
+                  // negative benefit score and should be evicted.
+                  if (b < 0.0)
+                    continue;
                   tier2.push_back({cachedName, viewRegistry.at(cachedName).size, b});
                 }
 
@@ -674,8 +674,7 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               queryViewArgs.emplace_back(std::move(s));
 
               if (!flatten) {
-                auto strategy =
-                    selectExecutionStrategy(viewIt->second, queryMetadata->trueCostMemo);
+                auto strategy = selectExecutionStrategy(viewIt->second);
                 queryViewArgs.emplace_back("Defer"_);
                 queryViewArgs.emplace_back(strategy == ExecutionStrategy::IsolatedMeasurement
                                                ? Symbol("IsolatedMeasurement")

@@ -101,8 +101,6 @@ struct Signature {
 // - dependencies: view names referenced via QueryView
 // - referencedColumns: columns referenced in the expression, used for pruning Gather outputs,
 // populated with extractAllReferencedColumns instead of during the walk
-// - trueCostMemo: used to memoise true cost computations during a single query's evaluation in VE1
-// useful for choosing candidate rewrites in findRewriting, to avoid redundant computations
 // - sideEffect: true if the definition contains prohibited operations
 // - creditAwarded: true if the view has been used to rewrite a query and the view's importance
 // factor has been incremented, so that we don't increment it againin the QueryView handler
@@ -111,7 +109,6 @@ struct Signature {
 struct ViewMetadata {
   std::unordered_set<boss::Symbol> dependencies;
   std::unordered_set<boss::Symbol> referencedColumns;
-  std::unordered_map<boss::Symbol, std::optional<double>> trueCostMemo;
   bool sideEffect = false;
   bool creditAwarded = false;
   Signature signature;

@@ -145,14 +145,14 @@
 (test-group "QueryView errors"
 
   (test "QueryView with no arguments throws"
-        '(ErrorWhenEvaluatingExpression (||) "QueryView requires 1 to 4 arguments")
+        '(ErrorWhenEvaluatingExpression (||) "QueryView requires 1 to 3 arguments")
         (ve-ace-ve-eval (QueryView)))
 
   (test "QueryView with too many arguments throws"
-      '(ErrorWhenEvaluatingExpression (||) "QueryView requires 1 to 4 arguments")
+      '(ErrorWhenEvaluatingExpression (||) "QueryView requires 1 to 3 arguments")
       (begin
         (ve-ace-ve-eval (DefineView V1 (Table (A 1))))
-        (ve-ace-ve-eval (QueryView V1 Defer Standard Structural ExtraArg))))
+        (ve-ace-ve-eval (QueryView V1 Defer Standard Extra))))
 
   (test "QueryView with non-symbol second argument throws"
         '(ErrorWhenEvaluatingExpression (||) "QueryView second argument must be a symbol: Admit, Reject, or Defer")
@@ -172,12 +172,6 @@
       (begin
         (ve-ace-ve-eval (DefineView V1 (Table (A 1))))
         (ve-ace-ve-eval (QueryView V1 Defer 42))))
-
-  (test "QueryView with unknown integrity mode throws"
-      '(ErrorWhenEvaluatingExpression (||) "QueryView unknown integrity mode: UnknownMode")
-      (begin
-        (ve-ace-ve-eval (DefineView V1 (Table (A 1))))
-        (ve-ace-ve-eval (QueryView V1 Defer Standard UnknownMode))))
 
   (test "QueryView on unknown view throws"
         '(ErrorWhenEvaluatingExpression (||) "View not found: NONEXISTENT")
@@ -1485,7 +1479,7 @@
         (begin
           (ve-eval (SetEngineMode Lite))
           (ve-eval (DefineView LM_LEGACY (Table (A 1 2 3))))
-          (ve-eval (QueryView LM_LEGACY Admit Standard Content))))
+          (ve-eval (QueryView LM_LEGACY Admit Standard))))
 
   (test "Bare view symbol substitutes directly with no rewrite metadata needed"
         '(Filter (Table (A 1 2 3)) (Greater A 1))

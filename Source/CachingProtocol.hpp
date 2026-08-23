@@ -41,35 +41,9 @@ enum class ExecutionStrategy {
 // defer the decision to the engine
 enum class CachingDecision { Admit, Reject, Defer };
 
-// Optional optimisation guideline for engines to follow while connecting their own caching logic to
-// this protocol. Designed to help engines identify when it is safe to use their own cached results
-// for the incoming BOSS expression, instead of reevaluating it. However, engines can always
-// choose to just reevaluate everything as normal. An integrity check is a comparison between the
-// incoming expression and the engine's own cached expression for the same view
-//
-// 2 modes of integrity checks are supported as options for QueryView calls These options can mean
-// different things to different engines but are designed with BOSS Table expressions in mind.
-//
-// Structural - more lightweight but incorrect when there are operators that modify values inline
-//              while preserving the overall structure of the BOSS table expression
-//              O(num_columns): schema + row count + null counts per column.
-//              100% correct for structural operators (Filter, Project,
-//              GroupBy, Join, ...)
-// Content - hash over the actual content of the expression
-//           O(n): xxHash3_128 over all column data.
-//           Practically 100% correct for everything.  Recommended for
-//           views ending in aggregations where the result is small and hashing is cheap
-enum class IntegrityCheckMode {
-  Structural,
-  Content,
-};
-
 struct CacheEntry {
   Expression value;
   CacheEntryType type;
-  std::optional<IntegrityCheckMode>
-      integrityMode; // guideline for engines, not a strict requirement
-
   ExecutionStrategy executionStrategy = ExecutionStrategy::Standard;
 
   // Running cost totals of wall time sprent producing or reusing this entry, accumulated by each
@@ -88,8 +62,8 @@ struct CacheEntry {
 // with Pending/Borrowed and referenced by CacheRef within the the WithCaches expression, which has
 // the following structure:
 // (WithCaches
-//   (Borrowed|Pending viewName1 viewDef1 [integrityMode1])
-//   (Borrowed|Pending viewName2 viewDef2 [integrityMode2])
+//   (Borrowed|Pending viewName1 viewDef1 strategy compute materialise reuse marginal)
+//   (Borrowed|Pending viewName2 viewDef2 strategy compute materialise reuse marginal)
 //   ...
 //   finalExpr)
 using CacheRegistry = std::unordered_map<boss::Symbol, CacheEntry>;
@@ -97,16 +71,6 @@ using CacheRegistry = std::unordered_map<boss::Symbol, CacheEntry>;
 // Default registry
 // Each engine compiled as a separate .so gets its own independent instance.
 inline CacheRegistry defaultCacheRegistry;
-
-// Helper functions to convert symbols to enums for integrity check mode and execution strategy
-inline std::optional<IntegrityCheckMode> symbolToIntegrityCheckMode(Symbol const &s) {
-  using boss::utilities::operator""_;
-  if (s == "Structural"_)
-    return IntegrityCheckMode::Structural;
-  if (s == "Content"_)
-    return IntegrityCheckMode::Content;
-  return std::nullopt;
-}
 
 inline std::optional<ExecutionStrategy> symbolToExecutionStrategy(Symbol const &s) {
   using boss::utilities::operator""_;
@@ -155,14 +119,10 @@ inline Expression unpackWithCaches(Expression &&expr, CacheRegistry &registry) {
     auto materialiseCost = std::get<double>(wDynamics[4]);
     auto reuseCost = std::get<double>(wDynamics[5]);
     auto marginalComputeCost = std::get<double>(wDynamics[6]);
-    std::optional<IntegrityCheckMode> mode = std::nullopt;
-    if (type == CacheEntryType::Borrowed && wDynamics.size() >= 8)
-      mode = symbolToIntegrityCheckMode(std::get<Symbol>(wDynamics[7]))
-                 .value_or(IntegrityCheckMode::Content);
 
-    registry[std::move(name)] = CacheEntry{
-        std::move(value),   type, mode, executionStrategy, computeCost, materialiseCost, reuseCost,
-        marginalComputeCost};
+    registry[std::move(name)] =
+        CacheEntry{std::move(value), type,      executionStrategy,  computeCost,
+                   materialiseCost,  reuseCost, marginalComputeCost};
   }
 
   return std::move(dynamics[numArgs - 1]);
@@ -176,8 +136,7 @@ inline Expression repackWithCaches(CacheRegistry &&registry, Expression &&finalE
 
   for (auto &&[name, entry] : registry) {
     boss::ExpressionArguments wrapperArgs;
-    auto const &mode = entry.integrityMode;
-    wrapperArgs.reserve(mode ? 8u : 7u);
+    wrapperArgs.reserve(7u);
     wrapperArgs.emplace_back(name);
     wrapperArgs.emplace_back(std::move(entry.value));
     wrapperArgs.emplace_back(entry.executionStrategy == ExecutionStrategy::IsolatedMeasurement
@@ -187,10 +146,6 @@ inline Expression repackWithCaches(CacheRegistry &&registry, Expression &&finalE
     wrapperArgs.emplace_back(entry.materialiseCost);
     wrapperArgs.emplace_back(entry.reuseCost);
     wrapperArgs.emplace_back(entry.marginalComputeCost);
-    if (mode) {
-      wrapperArgs.emplace_back(*mode == IntegrityCheckMode::Structural ? "Structural"_
-                                                                       : "Content"_);
-    }
 
     Symbol const wrapperHead = entry.type == CacheEntryType::Borrowed ? "Borrowed"_ : "Pending"_;
     args.emplace_back(ComplexExpression{wrapperHead, {}, std::move(wrapperArgs), {}});
