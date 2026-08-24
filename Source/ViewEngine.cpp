@@ -177,12 +177,14 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 entry.importanceFactor += 1.0;
               }
 
-              // If the user has explicitly specified a caching decision, we respect that and
-              // override any automatic decision Cannot override a user decision with an automatic
-              // one If view is called multiple times in the same query, we keep the last decision
-              if (decision != CachingDecision::Defer) {
+              // Only update the caching decision if it's not Reject and the current is not Admit
+              if (*decision != CachingDecision::Reject &&
+                  entry.cachingDecision != CachingDecision::Admit)
                 entry.cachingDecision = *decision;
-              }
+
+              // Invalidate the admission snapshot so that couldWinAdmission on future rewriting
+              // candidates will be based on the latest view state.
+              invalidateAdmissionSnapshot();
 
               // Short circuit repeated references to the same view in the same query
               // Read the cache registry to see the type of the view, and if it is Borrowed or
@@ -201,14 +203,14 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               // TODO: allow the user to explicitly prefer recalculating the view instead of using
               // the cached value
               if (viewCache.count(viewName)) {
+                if (*decision == CachingDecision::Reject)
+                  // Serves as an eviction hint, but only works if every time the view is
+                  // queried in the query, it is marked as rejected.
+                  entry.cachingDecision = *decision;
+
                 boss::ExpressionArguments cacheRefArgs;
                 cacheRefArgs.emplace_back(viewName);
                 cacheRefArgs.emplace_back("Borrowed"_);
-                if (defaultCacheRegistry.count(viewName)) {
-                  return Expression(
-                      ComplexExpression("CacheRef"_, {}, std::move(cacheRefArgs), {}));
-                }
-
                 // If it is a top-level QueryView and a cache hit, then the result is just the value
                 // of the cached view, and there is no further evaluation needed. Consequently, we
                 // can just mark the view as Borrowed (for consistency with non-top-level cache
@@ -232,25 +234,31 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               auto result = evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
                                      queryMetadata, true);
 
-              // Check if already registered to avoid duplicates
-              if (!defaultCacheRegistry.count(viewName)) {
-                ExecutionStrategy strategy =
-                    forcedStrategy.value_or((entry.computeCost > 0.0 || entry.materialiseCost > 0.0)
-                                                ? ExecutionStrategy::Standard
-                                                : ExecutionStrategy::IsolatedMeasurement);
+              // Only inlines for this specific call to QueryView, if a subsequent call doesn't
+              // reject a cache entry will still materialise it.
+              if (*decision == CachingDecision::Reject)
+                return evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
+                                queryMetadata, true, true);
 
-                Expression entryValue =
-                    strategy == ExecutionStrategy::IsolatedMeasurement
-                        ? evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
-                                   queryMetadata, true, true)
-                        : std::move(result);
+              // Decide on execution strategy
+              ExecutionStrategy strategy =
+                  forcedStrategy.value_or((entry.computeCost > 0.0 || entry.materialiseCost > 0.0)
+                                              ? ExecutionStrategy::Standard
+                                              : ExecutionStrategy::IsolatedMeasurement);
 
-                defaultCacheRegistry[viewName] = CacheEntry{
-                    std::move(entryValue),
-                    CacheEntryType::Pending,
-                    strategy,
-                };
-              }
+              // If the strategy is IsolatedMeasurement, then inline the view's definition to avoid
+              // CacheRefs to dependencies
+              Expression entryValue =
+                  strategy == ExecutionStrategy::IsolatedMeasurement
+                      ? evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
+                                 queryMetadata, true, true)
+                      : std::move(result);
+
+              defaultCacheRegistry[viewName] = CacheEntry{
+                  std::move(entryValue),
+                  CacheEntryType::Pending,
+                  strategy,
+              };
 
               boss::ExpressionArguments cacheRefArgs;
               cacheRefArgs.emplace_back(viewName);

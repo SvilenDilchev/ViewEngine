@@ -242,9 +242,15 @@ void ViewMetadata::intersectMerge(ViewMetadata &&other) {
 // Checks if a view join predicate is non-destructive with respect to
 // the information that the query is interested in
 static bool isSafeUnmatchedJoin(const JoinEdge &viewEdge, const Signature &queryParts) {
-  if (viewEdge.joinType != JoinType::LEFT && viewEdge.joinType != JoinType::ANTI)
-    return false; // If join is destructive on both sides (e.g., Inner Join)
+  if (viewEdge.joinType != JoinType::LEFT) {
+    // Inner Join is destructive on both sides of the join edge
+    // (Left)Anti Join is destructive on the left side of the join edge
+    // and doesn't even output the right side
+    return false;
+  }
 
+  // TODO: Left join is non-duplicative only if the right side of the join is unique on the join
+  // keys, explore how to express duplication and uniqueness in the signature
   for (const auto &src : viewEdge.rightSources) {
     if (queryParts.baseTables.count(src))
       return false; // If query cares about the source on the right (destructive side)
@@ -1513,12 +1519,18 @@ std::optional<Expression> findRewriting(const Expression &query, ViewMetadata &q
 
     double score = scoreView(viewMeta.signature, queryMetadata.signature);
 
-    if (score > -1.0) {
-      ageEntry(entry);
-      entry.importanceFactor += score;
-    }
+    if (score <= -1.0)
+      continue; // outright reject
 
-    if (score >= 1.0 && viewCache.count(name)) {
+    ageEntry(entry);
+    entry.importanceFactor += score;
+
+    auto registryEntry = defaultCacheRegistry.find(name);
+    bool const inRegistry = registryEntry != defaultCacheRegistry.end();
+    bool const resident = viewCache.count(name) ||
+                          (inRegistry && registryEntry->second.type == CacheEntryType::Borrowed);
+
+    if (score >= 1.0 && resident) {
       boss::ExpressionArguments args;
       args.push_back(Symbol(name));
       args.push_back("Defer"_);
@@ -1529,10 +1541,12 @@ std::optional<Expression> findRewriting(const Expression &query, ViewMetadata &q
       return queryView;
     }
 
-    if (score <= -1.0)
-      continue; // outright reject
-
     auto candCost = trueCost(name, true);
+
+    // Skip views that we know won't be admitted to the cache, to avoid materialising them
+    if (!viewCache.count(name) && !inRegistry && !couldWinAdmission(name, candCost))
+      continue;
+
     if (!bestName ||
         candidateViewRewriteComparator(*bestName, bestScore, bestCost, name, score, candCost)) {
       bestName = name;

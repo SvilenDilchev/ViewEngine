@@ -36,5 +36,13 @@ std::optional<double> trueCost(Symbol const &name, bool fallbackToIso = false,
 // Follows the formula benefit = (trueCost - reuseCost) * importance factor / size
 std::optional<double> benefit(boss::Symbol const &name, bool fallbackToIso = false);
 
+// Whether a view could claim enough space to survive admission, given what is
+// currently cached or in flight. True when the information to judge is missing, so the decision can
+// be deferred to VE2 where more information is available.
+bool couldWinAdmission(boss::Symbol const &name, std::optional<double> cost);
+// Drops the cached competitor ranking used by couldWinAdmission
+// and thus forces it to be rebuilt on the next call.
+void invalidateAdmissionSnapshot();
+
 // Depending on cost analysis it decides the execution strategy of the view
 ExecutionStrategy selectExecutionStrategy(ViewEntry &entry);

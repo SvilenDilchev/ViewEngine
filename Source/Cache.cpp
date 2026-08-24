@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 std::unordered_map<Symbol, Expression> viewCache;
 double viewCacheSize = 1e9; // 1 GB default limit
@@ -208,7 +209,7 @@ std::optional<double> benefit(boss::Symbol const &name, bool fallbackToIso) {
   if (it == viewRegistry.end())
     return std::nullopt; // Shouldn't happen in practice
 
-  auto const &entry = it->second;
+  auto &entry = it->second;
   if (entry.size <= 0.0)
     return std::nullopt;
 
@@ -216,8 +217,104 @@ std::optional<double> benefit(boss::Symbol const &name, bool fallbackToIso) {
   if (!cost)
     return std::nullopt;
 
+  ageEntry(entry); // Age the entry if it wasn't already, no-op otherwise
   double savings = *cost - entry.reuseCost;
   return savings * entry.importanceFactor / entry.size;
+}
+
+namespace {
+// Used during rewriting to determine whether a specific candidate view can be rejected from
+// admission to the cache outright. Important to void materialising a view that will be rejected
+// anyway, which is more expensive than just computing it from scratch as it just incurs the
+// materialisation costs and it can break up the pipelined execution of a parent view or query.
+struct AdmissionSnapshot {
+  bool valid = false;
+  std::vector<std::pair<double, double>> deferTier; // (benefit, space used before it), descending
+  double usedAfterAll = 0.0;
+};
+// TODO: explore persisting benefit scores between VE1 and VE2. importanceFactor is
+// provably identical across the two passes (ageEntry maps both ticks to the same query
+// index, and increments only happen in VE1), so only the views whose costs/size VE2
+// refreshes -- the defaultCacheRegistry entries -- and their transitive dependants
+// (viewToViews) would need recomputing.
+AdmissionSnapshot admissionSnapshot;
+
+// Build a sorted benefit ranking of all views that are either cached or in the defaultCacheRegistry
+// TODO: Currently rebuilds the whole ranking on each call, but could be optimised to only update
+// the changed views and their transitive dependants.
+void buildAdmissionSnapshot() {
+  auto &snap = admissionSnapshot;
+  snap.deferTier.clear();
+  std::vector<std::pair<double, double>> admitTier; // (benefit, size)
+  std::vector<std::pair<double, double>> deferSized;
+  auto add = [&](boss::Symbol const &name) {
+    auto it = viewRegistry.find(name);
+    if (it == viewRegistry.end() || it->second.size <= 0.0)
+      return;
+    auto const b = benefit(name, true).value_or(0.0);
+    if (it->second.cachingDecision == CachingDecision::Admit)
+      admitTier.emplace_back(b, it->second.size);
+    else
+      deferSized.emplace_back(b, it->second.size);
+  };
+  // NOTE: no view can be simultaneously in viewCache and defaultCacheRegistry, except for the
+  // top-level QueryView cache hit, which will never reach this code because QueryView is not a
+  // rewritable operator
+  for (auto const &[name, value] : viewCache)
+    add(name);
+  for (auto const &[name, entry] : defaultCacheRegistry)
+    add(name);
+  auto byBenefitDesc = [](auto const &a, auto const &b) { return a.first > b.first; };
+  std::sort(admitTier.begin(), admitTier.end(), byBenefitDesc);
+  std::sort(deferSized.begin(), deferSized.end(), byBenefitDesc);
+
+  double used = 0.0;
+  for (auto const &[b, size] : admitTier)
+    if (used + size <= viewCacheSize)
+      used += size;
+  snap.deferTier.reserve(deferSized.size());
+  for (auto const &[b, size] : deferSized) {
+    snap.deferTier.emplace_back(b, used);
+    if (used + size <= viewCacheSize)
+      used += size;
+  }
+  snap.usedAfterAll = used;
+  snap.valid = true;
+}
+} // namespace
+
+void invalidateAdmissionSnapshot() { admissionSnapshot.valid = false; }
+
+bool couldWinAdmission(boss::Symbol const &name, std::optional<double> cost) {
+  auto it = viewRegistry.find(name);
+  if (it == viewRegistry.end() || it->second.size <= 0.0)
+    return true;
+  auto &entry = it->second;
+  // Safe to fallback to iso because iso is usually more expensive
+  // than std, so it will overestimate the benefit and not cause the
+  // view to get outright rejected from even being materialised.
+  // Technically, if the currently evaluated candidate has std info but the
+  // rest of the views in the snapshot are all iso-only, then this can be an
+  // underestimate, but that is only an issue while std info is missing for the
+  // views surrounding the candidate in the snapshot, which will gather their std
+  // info the next time they are evaluated, so it is not a problem in practice.
+  if (!cost)
+    cost = trueCost(name, true);
+  if (!cost)
+    return true; // Missing info, so we can't make a decision, defer to VE2 where more information
+                 // is available
+  ageEntry(entry);
+  double const myBenefit = (*cost - entry.reuseCost) * entry.importanceFactor / entry.size;
+
+  if (!admissionSnapshot.valid)
+    buildAdmissionSnapshot(); // Rebuild a valid snapshot
+
+  // Mimic the admission process in VE2 WithCaches handler
+  auto const &deferTier = admissionSnapshot.deferTier;
+  auto pos = std::partition_point(deferTier.begin(), deferTier.end(),
+                                  [&](auto const &e) { return e.first >= myBenefit; });
+  double const used = pos == deferTier.end() ? admissionSnapshot.usedAfterAll : pos->second;
+  return used + entry.size <= viewCacheSize;
 }
 
 ExecutionStrategy selectExecutionStrategy(ViewEntry &entry) {
