@@ -38,16 +38,16 @@ endif()
 include(ExternalProject)
 
 # Configuration for BOSS
-set(BOSS_SOURCE_BRANCH main CACHE STRING "If BOSS core is built from source, which branch should be fetched")
+# Pinned so every build here and in Ablation gets the same BOSS. This is the commit the report
+# cites. Nothing to update, since it never moves.
+set(BOSS_SOURCE_BRANCH a7f0d49 CACHE STRING "BOSS commit to build against")
 set(BOSS_SOURCE_REPOSITORY https://github.com/symbol-store/BOSS.git CACHE STRING "URL for the BOSS repository")
 
 ExternalProject_Add(BOSS
   GIT_REPOSITORY ${BOSS_SOURCE_REPOSITORY}
   DOWNLOAD_DIR $ENV{HOME}/.cmake-downloads/${CMAKE_PROJECT_NAME}
   GIT_TAG ${BOSS_SOURCE_BRANCH}
-  GIT_SHALLOW ON
-  # Force update from remote on every build
-  UPDATE_COMMAND git fetch origin ${BOSS_SOURCE_BRANCH} && git reset --hard origin/${BOSS_SOURCE_BRANCH}
+  UPDATE_COMMAND ""
   CMAKE_ARGS
     -DCMAKE_INSTALL_PREFIX=${ViewEngine_BINARY_DIR}/deps
     $<IF:$<CONFIG:>,,-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}>
