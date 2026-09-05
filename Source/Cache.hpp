@@ -12,6 +12,7 @@ struct AdmissionCandidate {
   boss::Symbol name;
   double size;
   double benefit;
+  uint64_t lastUsed = 0;
 };
 
 // Global cache for storing evaluated views. This is a simple in-memory cache that maps view names
@@ -19,6 +20,10 @@ struct AdmissionCandidate {
 extern std::unordered_map<Symbol, Expression> viewCache;
 extern double viewCacheSize;      // Total size of the view cache in bytes
 extern double viewCacheOccupancy; // Current occupancy of the view cache in bytes
+
+// Ordering policy for cache admission. Lowest ranking views are evicted.
+enum class EvictionPolicy { Benefit, LRU, Random };
+extern EvictionPolicy evictionPolicy;
 
 // Compute the size of a view after evaluating it.
 // The result must be a table expression, otherwise an exception is thrown.

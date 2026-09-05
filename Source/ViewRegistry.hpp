@@ -23,6 +23,8 @@ struct ViewEntry {
 
   double importanceFactor = 0.0;        // Used to rank views for eviction from cache
   uint64_t importanceLastAgedQuery = 0; // Last query when importance was aged
+  uint64_t reuseLastMeasuredQuery = 0;  // Last query when reuseCost was actually measured
+  uint64_t lastUsedQuery = 0;           // Last query when the view was hit or (re)built
 
   CachingDecision cachingDecision = CachingDecision::Defer; // Whether the view should be cached
 };
@@ -54,6 +56,17 @@ extern std::unordered_map<boss::Symbol, std::unordered_set<boss::Symbol>> viewTo
 extern uint64_t veTick;
 constexpr double IMPORTANCE_DECAY_FACTOR = 0.98;
 
+// Smoothing factor for cost estimates: one sample moves the estimate by at most this fraction,
+// so a single measurement outlier (e.g. an allocator stall landing inside a conversion) cannot
+// flip a view's benefit sign on its own.
+constexpr double COST_EMA_ALPHA = 0.2;
+// How long a negative-benefit verdict stands before the view is given one retry (which
+// re-measures reuseCost and either heals or re-condemns the estimate).
+constexpr uint64_t CONDEMNED_RETRY_QUERIES = 50;
+
+// veTick increments twice per query (VE runs at both ends of the pipeline).
+inline uint64_t currentQueryIndex() { return (veTick + 1) / 2; }
+
 // Age the importance factor of a view entry based on how many queries
 // have been executed since it was last aged.
 void ageEntry(ViewEntry &entry);
@@ -75,5 +88,6 @@ std::unordered_set<boss::Symbol> unionExpanded(const std::unordered_set<boss::Sy
 std::unordered_set<boss::Symbol> expandBaseTables(const boss::Symbol &viewName,
                                                   std::unordered_set<boss::Symbol> &visited);
 
-// Checks if the new value is > 0.0 and updates the target field if so
-void storeIfPositive(double &target, const double newValue);
+// Folds a new cost sample into the stored estimate; a value <= 0.0 means
+//  the cost was not measured this pass and leaves the estimate untouched.
+void storeCostSample(double &target, const double newValue);

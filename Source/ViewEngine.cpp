@@ -3,10 +3,48 @@
 #include "MetadataRegistry.hpp"
 #include "ViewRegistry.hpp"
 
+#include <chrono>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <sstream>
+#include <string>
 #include <unordered_set>
 #include <utility>
 
 using boss::expressions::CloneReason;
+
+// ---------------------------------------------------------------------------
+// Diagnostic logging of the caching decisions (hit/miss/admit/evict/drop), off
+// unless BOSS_VE_DEBUG is set to a non-empty, non-"0" value.
+// Used for submission, will remove and replace in the future for a cleaner system
+// ---------------------------------------------------------------------------
+static bool veDebugEnabled() {
+  static const bool enabled = [] {
+    const char *v = std::getenv("BOSS_VE_DEBUG");
+    return v != nullptr && std::string(v) != "0" && std::string(v) != "";
+  }();
+  return enabled;
+}
+
+struct VeTimer {
+  std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  double elapsed() const {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  }
+};
+
+static std::string veNum(double v) {
+  std::ostringstream os;
+  os << std::scientific << std::setprecision(4) << v;
+  return os.str();
+}
+
+static void veLog(std::string const &msg) {
+  if (veDebugEnabled())
+    std::cerr << "[VE] " << msg << "\n";
+}
 
 static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr,
                            bool skipRewrite = false, bool flatten = false, bool topLevel = false) {
@@ -203,6 +241,11 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               // TODO: allow the user to explicitly prefer recalculating the view instead of using
               // the cached value
               if (viewCache.count(viewName)) {
+                entry.lastUsedQuery = currentQueryIndex();
+                veLog("HIT  " + viewName.getName() + " size=" + std::to_string(entry.size) +
+                      " occupancy=" + std::to_string(viewCacheOccupancy) + "/" +
+                      std::to_string(viewCacheSize));
+
                 if (*decision == CachingDecision::Reject)
                   // Serves as an eviction hint, but only works if every time the view is
                   // queried in the query, it is marked as rejected.
@@ -231,14 +274,19 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               }
 
               // Cache miss
+              veLog("MISS " + viewName.getName() + " size=" + std::to_string(entry.size) +
+                    " occupancy=" + std::to_string(viewCacheOccupancy) + "/" +
+                    std::to_string(viewCacheSize) + " -- recomputing view definition");
               auto result = evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
                                      queryMetadata, true);
 
               // Only inlines for this specific call to QueryView, if a subsequent call doesn't
               // reject a cache entry will still materialise it.
-              if (*decision == CachingDecision::Reject)
+              if (*decision == CachingDecision::Reject) {
+                veLog("INLINE " + viewName.getName() + " -- Reject, not materialising");
                 return evaluate(entry.definition.clone(CloneReason::EVALUATE_CONST_EXPRESSION),
                                 queryMetadata, true, true);
+              }
 
               // Decide on execution strategy
               ExecutionStrategy strategy =
@@ -295,13 +343,19 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                   continue;
                 }
 
-                storeIfPositive(it->second.computeCost, entry.computeCost);
-                storeIfPositive(it->second.materialiseCost, entry.materialiseCost);
+                it->second.lastUsedQuery = currentQueryIndex();
+                storeCostSample(it->second.computeCost, entry.computeCost);
+                storeCostSample(it->second.materialiseCost, entry.materialiseCost);
                 // Reuse cost is only relevant when reusing a view's value to compute a new result,
                 // so should not be updated for a top-level QueryView cache hit
-                storeIfPositive(it->second.reuseCost, entry.reuseCost);
-                storeIfPositive(it->second.marginalComputeCost, entry.marginalComputeCost);
-                it->second.size = computeSize(entry.value);
+                storeCostSample(it->second.reuseCost, entry.reuseCost);
+                if (entry.reuseCost > 0.0)
+                  it->second.reuseLastMeasuredQuery = currentQueryIndex();
+                storeCostSample(it->second.marginalComputeCost, entry.marginalComputeCost);
+                // Size is deterministic for a materialised value; 0 means the evaluation
+                // failed or stayed symbolic, which must not clobber a known size.
+                if (auto sz = computeSize(entry.value); sz > 0.0)
+                  it->second.size = sz;
               }
 
               std::unordered_set<boss::Symbol> finalSet; // Views to remain/admit in cache
@@ -348,11 +402,15 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
 
                   // If both compute and reuse costs are known, and the reuse cost is somehow more
                   // expensive, it will result in a negative benefit score, which means that the
-                  // view is not worth caching, so we skip it.
-                  if (decision != CachingDecision::Admit && b < 0.0)
+                  // view is not worth caching, so we skip it. A stale verdict (no reuse
+                  // measurement for CONDEMNED_RETRY_QUERIES) is allowed through once so the next
+                  // hit can re-measure it.
+                  if (decision != CachingDecision::Admit && b < 0.0 &&
+                      currentQueryIndex() <
+                          viewEntry.reuseLastMeasuredQuery + CONDEMNED_RETRY_QUERIES)
                     continue;
 
-                  AdmissionCandidate candidate{name, viewEntry.size, b};
+                  AdmissionCandidate candidate{name, viewEntry.size, b, viewEntry.lastUsedQuery};
                   (decision == CachingDecision::Admit ? tier1 : tier2)
                       .push_back(std::move(candidate));
                 }
@@ -366,19 +424,43 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
 
                   // A view that was admitted in a previous query (due to an unknown reuse cost)
                   // that is now known to be more expensive to reuse than to recompute will have a
-                  // negative benefit score and should be evicted.
-                  if (b < 0.0)
+                  // negative benefit score and should be evicted -- unless the verdict is stale,
+                  // in which case it stays in contention so a later hit can re-measure it.
+                  if (b < 0.0 &&
+                      currentQueryIndex() < viewRegistry.at(cachedName).reuseLastMeasuredQuery +
+                                                CONDEMNED_RETRY_QUERIES)
                     continue;
-                  tier2.push_back({cachedName, viewRegistry.at(cachedName).size, b});
+                  tier2.push_back({cachedName, viewRegistry.at(cachedName).size, b,
+                                   viewRegistry.at(cachedName).lastUsedQuery});
                 }
 
-                // Sort tier1 and tier2 by benefit, descending
-                auto benefitComparator = [](AdmissionCandidate const &a,
-                                            AdmissionCandidate const &b) {
-                  return a.benefit > b.benefit;
-                };
-                std::sort(tier1.begin(), tier1.end(), benefitComparator);
-                std::sort(tier2.begin(), tier2.end(), benefitComparator);
+                // Victim ordering per evictionPolicy (SetEvictionPolicy); LRU and Random
+                // are baseline policies for the eviction comparison.
+                switch (evictionPolicy) {
+                case EvictionPolicy::LRU: {
+                  auto lruComparator = [](AdmissionCandidate const &a,
+                                          AdmissionCandidate const &b) {
+                    return a.lastUsed > b.lastUsed;
+                  };
+                  std::sort(tier1.begin(), tier1.end(), lruComparator);
+                  std::sort(tier2.begin(), tier2.end(), lruComparator);
+                  break;
+                }
+                case EvictionPolicy::Random: {
+                  static std::mt19937 evictionRng(42);
+                  std::shuffle(tier1.begin(), tier1.end(), evictionRng);
+                  std::shuffle(tier2.begin(), tier2.end(), evictionRng);
+                  break;
+                }
+                case EvictionPolicy::Benefit:
+                  auto benefitComparator = [](AdmissionCandidate const &a,
+                                              AdmissionCandidate const &b) {
+                    return a.benefit > b.benefit;
+                  };
+                  std::sort(tier1.begin(), tier1.end(), benefitComparator);
+                  std::sort(tier2.begin(), tier2.end(), benefitComparator);
+                  break;
+                }
 
                 double usedSize = 0.0;
 
@@ -412,6 +494,8 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
               // Phase 3: Evict all views not in the final set, and admit new views that made it
               for (auto it = viewCache.begin(); it != viewCache.end();) {
                 if (!finalSet.count(it->first)) {
+                  veLog("EVICT " + it->first.getName() +
+                        " size=" + std::to_string(viewRegistry.at(it->first).size));
                   viewCacheOccupancy -= viewRegistry.at(it->first).size;
                   it = viewCache.erase(it);
                 } else {
@@ -422,10 +506,19 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 if (inPlaceName && name == *inPlaceName)
                   continue; // Skip the top-level QueryView cache hit view
                 if (finalSet.count(name)) {
+                  veLog("ADMIT " + name.getName() +
+                        " size=" + std::to_string(viewRegistry.at(name).size));
                   viewCache[name] = std::move(entry.value);
                   viewCacheOccupancy += viewRegistry.at(name).size;
+                } else {
+                  veLog("DROP  " + name.getName() +
+                        " size=" + std::to_string(viewRegistry.at(name).size) + " type=" +
+                        (entry.type == CacheEntryType::Borrowed ? "Borrowed" : "Pending") +
+                        " -- did not make finalSet");
                 }
               }
+              veLog("PASS-END occupancy=" + std::to_string(viewCacheOccupancy) + "/" +
+                    std::to_string(viewCacheSize) + " cached=" + std::to_string(viewCache.size()));
 
               defaultCacheRegistry.clear();
               return result;
@@ -636,6 +729,29 @@ static Expression evaluate(Expression &&e, ViewMetadata *queryMetadata = nullptr
                 return Expression(false);
 
               viewCacheSize = bytes;
+              return Expression(true);
+            }
+
+            if (head == "SetEvictionPolicy"_) {
+              if (!topLevel)
+                return Expression(false);
+
+              if (dynamics.size() != 1)
+                return Expression(false); // SetEvictionPolicy requires exactly 1 argument
+
+              auto *policy = std::get_if<Symbol>(&dynamics[0]);
+              if (!policy)
+                return Expression(false);
+
+              if (*policy == "Benefit"_)
+                evictionPolicy = EvictionPolicy::Benefit;
+              else if (*policy == "LRU"_)
+                evictionPolicy = EvictionPolicy::LRU;
+              else if (*policy == "Random"_)
+                evictionPolicy = EvictionPolicy::Random;
+              else
+                return Expression(false);
+
               return Expression(true);
             }
 

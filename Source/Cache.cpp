@@ -8,7 +8,8 @@
 std::unordered_map<Symbol, Expression> viewCache;
 double viewCacheSize = 1e9; // 1 GB default limit
 double viewCacheOccupancy = 0.0;
-
+EvictionPolicy evictionPolicy = EvictionPolicy::Benefit;
+  
 // Table size computation
 namespace {
 constexpr size_t kVarWidthSampleSize = 64; // Number of rows to sample for variable-width columns
@@ -305,6 +306,13 @@ bool couldWinAdmission(boss::Symbol const &name, std::optional<double> cost) {
                  // is available
   ageEntry(entry);
   double const myBenefit = (*cost - entry.reuseCost) * entry.importanceFactor / entry.size;
+
+  // Mirror the admission stage's negative-benefit filter: a view that admission would refuse
+  // must not be materialised at all. User-forced Admit is exempt, and a stale verdict is let
+  // through so its retry can re-measure the reuse cost.
+  if (myBenefit < 0.0 && entry.cachingDecision != CachingDecision::Admit &&
+      currentQueryIndex() < entry.reuseLastMeasuredQuery + CONDEMNED_RETRY_QUERIES)
+    return false;
 
   if (!admissionSnapshot.valid)
     buildAdmissionSnapshot(); // Rebuild a valid snapshot

@@ -90,7 +90,8 @@ std::unordered_set<boss::Symbol> expandBaseTables(const boss::Symbol &viewName,
   return it->second.expandedBaseTables;
 }
 
-void storeIfPositive(double &target, const double newValue) {
-  if (newValue > 0.0)
-    target = newValue;
+void storeCostSample(double &target, const double newValue) {
+  if (newValue <= 0.0)
+    return;
+  target = target > 0.0 ? COST_EMA_ALPHA * newValue + (1.0 - COST_EMA_ALPHA) * target : newValue;
 }

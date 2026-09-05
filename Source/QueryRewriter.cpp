@@ -4,6 +4,7 @@
 #include "MetadataRegistry.hpp"
 #include "ViewRegistry.hpp"
 #include <Expression.hpp>
+#include <optional>
 
 #include <algorithm>
 #include <ranges>
@@ -45,6 +46,12 @@ static const std::unordered_map<boss::Symbol, boss::Symbol> conversePredicateOpe
     {"Less"_, "Greater"_},
     {"GreaterEqual"_, "LessEqual"_},
     {"LessEqual"_, "GreaterEqual"_}};
+
+// Map of aggregate operators to the output column names ACE gives their results - E.g.,
+// Sum(colName) is output as sum(colName)
+static const std::unordered_map<Symbol, std::string> aggregateOperatorOutputNames = {
+    {"Sum"_, "sum"},     {"Min"_, "min"},  {"Max"_, "max"},
+    {"Count"_, "count"}, {"Avg"_, "mean"}, {"Mean"_, "mean"}};
 
 static std::string serialiseExpr(const Expression &expr) {
   return std::visit(boss::utilities::overload(
@@ -221,22 +228,66 @@ void ViewMetadata::intersectMerge(ViewMetadata &&other) {
   for (auto &[col, preds] : other.signature.columnPredicates)
     signature.columnPredicates[col].merge(preds);
 
-  for (auto &[col, expr] : other.signature.projectedColumns) {
-    auto it = signature.projectedColumns.find(col);
-    if (it != signature.projectedColumns.end()) {
-      if (!projectedExprsMatch(it->second, expr)) {
-        // Conflicting projections on the same column from different join branches
-        sideEffect = true;
-        return;
-      }
-    } else {
-      signature.projectedColumns.emplace(col, expr);
-    }
-  }
+  // projectedColumns is deliberately NOT merged here: a join's output schema (branch
+  // union, _l/_r collision suffixes, anti-join left-only) is computed by the Join handler
+  // in walkView, which owns the combine. Other callers merge scalar predicate branches
+  // that carry no projections.
 
   signature.joinEdges.insert(signature.joinEdges.end(),
                              std::make_move_iterator(other.signature.joinEdges.begin()),
                              std::make_move_iterator(other.signature.joinEdges.end()));
+}
+
+// Accumulate the output columns of a set of sources, recursing through view
+// dependencies down to base tables: a view contributes its declared projections, or --
+// when it declares none -- whatever its own sources output. Returns false only for a
+// source in neither registry, which should not occur for well-formed expressions.
+static bool
+accumulateOutputColumns(const std::unordered_set<boss::Symbol> &tables,
+                        const std::unordered_set<boss::Symbol> &views,
+                        std::unordered_map<boss::Symbol, std::shared_ptr<Expression>> &out,
+                        std::unordered_set<boss::Symbol> &visited) {
+  for (const auto &table : tables) {
+    auto it = tableRegistry.find(table);
+    if (it == tableRegistry.end())
+      return false;
+    for (const auto &col : it->second.columns)
+      out.emplace(col, nullptr);
+  }
+  for (const auto &view : views) {
+    if (!visited.insert(view).second)
+      continue; // already resolved (or a definition cycle)
+    auto it = viewRegistry.find(view);
+    if (it == viewRegistry.end())
+      return false;
+    const auto &entry = it->second;
+    if (!entry.signature.projectedColumns.empty()) {
+      for (const auto &[col, expr] : entry.signature.projectedColumns)
+        out.emplace(col, expr);
+    } else if (!accumulateOutputColumns(entry.signature.baseTables, entry.dependencies, out,
+                                        visited)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The output schema of a join branch: its declared projections, or -- for a branch with
+// no Project/GroupBy anywhere, which preserves every column -- the resolved output of
+// its sources (base tables directly; views recursively down to base tables).
+// TODO: Figure this out -- Defeats the whole purpose of expanding signatures lazily at query time,
+// but is necessary for this correctness check
+static std::optional<std::unordered_map<boss::Symbol, std::shared_ptr<Expression>>>
+joinBranchOutput(const ViewMetadata &branch) {
+  if (!branch.signature.projectedColumns.empty())
+    return branch.signature.projectedColumns;
+  std::unordered_map<boss::Symbol, std::shared_ptr<Expression>> out;
+  std::unordered_set<boss::Symbol> visited;
+  if (!accumulateOutputColumns(branch.signature.baseTables, branch.dependencies, out, visited))
+    return std::nullopt;
+  if (out.empty())
+    return std::nullopt;
+  return out;
 }
 
 // Checks if a view join predicate is non-destructive with respect to
@@ -398,6 +449,26 @@ static Interval buildComparisonInterval(const Symbol &head, const DomainValue &l
   return interval;
 }
 
+// True if every column referenced in the expression is in the sourceColumns set, and no table or
+// view symbols are referenced in the expression. Used for nested Project validation.
+bool aliasedExprSafeToProject(const Expression &e,
+                              const std::unordered_set<boss::Symbol> &sourceColumns) {
+  return std::visit(boss::utilities::overload(
+                        [&](const ComplexExpression &ce) {
+                          for (const auto &arg : ce.getDynamicArguments())
+                            if (!aliasedExprSafeToProject(arg, sourceColumns))
+                              return false;
+                          return true;
+                        },
+                        [&](const Symbol &s) {
+                          if (viewRegistry.count(s) || tableRegistry.count(s))
+                            return false; // table-valued symbol in scalar position: malformed
+                          return sourceColumns.count(s) > 0;
+                        },
+                        [](const auto &) { return true; }), // literals are always fine
+                    e);
+}
+
 void walkView(const Expression &expr, ViewMetadata &metadata) {
   std::visit(
       boss::utilities::overload(
@@ -484,6 +555,8 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
               return;
             }
 
+            // TODO: To make sure this is actually completely safe we need to recurse down to base
+            // tables to check for nested projects within dependencies.
             if (head == "Project"_) {
               if (dynamics.empty()) {
                 metadata.sideEffect = true; // Treat malformed Project as side effect
@@ -491,26 +564,68 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
               }
 
               walkView(dynamics[0], metadata);
-              metadata.signature.projectedColumns.clear();
-              for (size_t i = 1; i < dynamics.size(); ++i) {
-                if (const auto *s = std::get_if<Symbol>(&dynamics[i])) {
-                  metadata.signature.projectedColumns.emplace(*s, nullptr);
-                } else if (const auto *ce = std::get_if<ComplexExpression>(&dynamics[i])) {
-                  if (ce->getHead() != "As"_ ||
-                      ce->getDynamicArguments().size() != 2) { // Handle As(expr, alias) projections
-                    metadata.sideEffect = true;
-                    return;
+
+              // If first Project, just populate the projectedColumns map with the column symbols.
+              if (metadata.signature.projectedColumns.empty())
+                for (size_t i = 1; i < dynamics.size(); ++i) {
+                  if (const auto *s = std::get_if<Symbol>(&dynamics[i])) {
+                    metadata.signature.projectedColumns.emplace(*s, nullptr);
+                  } else if (const auto *ce = std::get_if<ComplexExpression>(&dynamics[i])) {
+                    if (ce->getHead() != "As"_ || ce->getDynamicArguments().size() !=
+                                                      2) { // Handle As(expr, alias) projections
+                      metadata.sideEffect = true;
+                      return;
+                    }
+                    const auto *alias = std::get_if<Symbol>(&ce->getDynamicArguments()[1]);
+                    if (!alias) {
+                      metadata.sideEffect = true;
+                      return;
+                    }
+                    auto shared = std::make_shared<Expression>(
+                        ce->getDynamicArguments()[0].clone(CloneReason::EXPRESSION_WRAPPING));
+                    metadata.signature.projectedColumns.emplace(*alias, std::move(shared));
+                    walkView(ce->getDynamicArguments()[0], metadata);
                   }
-                  const auto *alias = std::get_if<Symbol>(&ce->getDynamicArguments()[1]);
-                  if (!alias) {
-                    metadata.sideEffect = true;
-                    return;
-                  }
-                  auto shared = std::make_shared<Expression>(
-                      ce->getDynamicArguments()[0].clone(CloneReason::EXPRESSION_WRAPPING));
-                  metadata.signature.projectedColumns.emplace(*alias, std::move(shared));
-                  walkView(ce->getDynamicArguments()[0], metadata);
                 }
+              else {
+                // If not first Project, check that the projected columns are a subset of the
+                // source's
+                std::unordered_map<boss::Symbol, std::shared_ptr<Expression>> newProjections;
+                std::unordered_set<boss::Symbol> sourceColumns;
+                sourceColumns.reserve(metadata.signature.projectedColumns.size());
+                for (const auto &[col, expr] : metadata.signature.projectedColumns)
+                  sourceColumns.insert(col);
+                for (size_t i = 1; i < dynamics.size(); ++i) {
+                  if (const auto *s = std::get_if<Symbol>(&dynamics[i])) {
+                    if (metadata.signature.projectedColumns.count(*s))
+                      newProjections.emplace(*s, metadata.signature.projectedColumns[*s]);
+                    else {
+                      metadata.sideEffect = true; // Projecting a column not in the source
+                      return;
+                    }
+                  } else if (const auto *ce = std::get_if<ComplexExpression>(&dynamics[i])) {
+                    if (ce->getHead() != "As"_ || ce->getDynamicArguments().size() != 2) {
+                      metadata.sideEffect = true;
+                      return;
+                    }
+                    const auto *alias = std::get_if<Symbol>(&ce->getDynamicArguments()[1]);
+                    if (!alias) {
+                      metadata.sideEffect = true;
+                      return;
+                    }
+                    // This should be enough of a walk, no need to recurse into the expression, just
+                    // check that it only references source columns
+                    if (!aliasedExprSafeToProject(ce->getDynamicArguments()[0], sourceColumns)) {
+                      metadata.sideEffect = true; // Projecting an expression that references
+                                                  // columns not in the source
+                      return;
+                    }
+                    auto shared = std::make_shared<Expression>(
+                        ce->getDynamicArguments()[0].clone(CloneReason::EXPRESSION_WRAPPING));
+                    newProjections.emplace(*alias, std::move(shared));
+                  }
+                }
+                metadata.signature.projectedColumns = std::move(newProjections);
               }
               return;
             }
@@ -533,6 +648,9 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
               std::unordered_set<boss::Symbol> allRights = rightMeta.signature.baseTables;
               allRights.insert(rightMeta.dependencies.begin(), rightMeta.dependencies.end());
 
+              auto leftOutput = joinBranchOutput(leftMeta);
+              auto rightOutput = joinBranchOutput(rightMeta);
+
               metadata.intersectMerge(std::move(leftMeta));
               // Remove the predicates for the destructive side of an unsafe join and flag the
               // signature as unsafe
@@ -544,6 +662,25 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
                   rightMeta.signature.columnPredicates.clear();
                 }
               metadata.intersectMerge(std::move(rightMeta));
+
+              // The join's output schema. Colliding names get ACE's _l/_r suffixes, which
+              // follow the LOGICAL sides regardless of the runtime build-side swap (see
+              // buildJoin in ACE: the swap exchanges the suffixes along with the inputs).
+              // An anti join outputs the left side only. If a needed branch's schema is unknown,
+              // no claim is made and validation above stays permissive.
+              metadata.signature.projectedColumns.clear();
+              if (parsedJoinType == JoinType::ANTI) {
+                if (leftOutput)
+                  metadata.signature.projectedColumns = std::move(*leftOutput);
+              } else if (leftOutput && rightOutput) {
+                auto &combined = metadata.signature.projectedColumns;
+                for (auto &[col, expr] : *leftOutput)
+                  combined.emplace(rightOutput->count(col) ? Symbol(col.getName() + "_l") : col,
+                                   expr);
+                for (auto &[col, expr] : *rightOutput)
+                  combined.emplace(leftOutput->count(col) ? Symbol(col.getName() + "_r") : col,
+                                   expr);
+              }
 
               std::vector<std::pair<Expression, Expression>> keyPairs;
               for (size_t i = 2; i < dynamics.size(); ++i) {
@@ -876,9 +1013,60 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
               return;
             }
 
-            // TODO: handle aggregations
-            // For now it's with the passthroughs like ordering operators
-            if (head == "GroupBy"_ || head == "OrderBy"_ || head == "Slice"_) {
+            // TODO: handle aggregations; for now it's with the passthroughs like ordering
+            // operators, but does populate the projectedColumns with the aggregate output names so
+            // that columnSurvivesProjection can correctly determine that a pre-aggregation column
+            // is not present in the output of a GroupBy
+            if (head == "GroupBy"_) {
+              if (dynamics.empty()) {
+                metadata.sideEffect = true;
+                return;
+              }
+              // Walk source first to populate the projectedColumns map with the input columns
+              walkView(dynamics[0], metadata);
+
+              // If the input's schema has had projections before, group keys and aggregate input
+              // columns must exist in it
+              auto source = std::move(metadata.signature.projectedColumns);
+              const bool validate = !source.empty();
+              metadata.signature.projectedColumns.clear();
+              for (size_t i = 1; i < dynamics.size(); ++i) {
+                if (const auto *key = std::get_if<Symbol>(&dynamics[i])) {
+                  if (validate) {
+                    auto it = source.find(*key);
+                    if (it == source.end()) {
+                      metadata.sideEffect = true; // grouping by a column the input doesn't have
+                      return;
+                    }
+                    metadata.signature.projectedColumns.emplace(*key, it->second);
+                  } else {
+                    metadata.signature.projectedColumns.emplace(*key, nullptr);
+                  }
+                } else if (const auto *agg = std::get_if<ComplexExpression>(&dynamics[i])) {
+                  if (agg->getHead() == "CountAll"_) {
+                    metadata.signature.projectedColumns.emplace(Symbol("count_all()"), nullptr);
+                    continue;
+                  }
+                  auto nameIt = aggregateOperatorOutputNames.find(agg->getHead());
+                  const auto *col = agg->getDynamicArguments().size() == 1
+                                        ? std::get_if<Symbol>(&agg->getDynamicArguments()[0])
+                                        : nullptr;
+                  if (nameIt == aggregateOperatorOutputNames.end() || col == nullptr) {
+                    metadata.sideEffect = true; // unknown aggregate shape: refuse to reason
+                    return;
+                  }
+                  if (validate && source.count(*col) == 0) {
+                    metadata.sideEffect = true; // aggregating a column the input doesn't have
+                    return;
+                  }
+                  metadata.signature.projectedColumns.emplace(
+                      Symbol(nameIt->second + "(" + col->getName() + ")"), nullptr);
+                }
+              }
+              return;
+            }
+
+            if (head == "OrderBy"_ || head == "Slice"_) {
               if (dynamics.empty()) {
                 // Treat malformed passthrough operators as side effect
                 metadata.sideEffect = true;
@@ -906,6 +1094,7 @@ void walkView(const Expression &expr, ViewMetadata &metadata) {
 }
 
 // Expands view sources down to their base tables for accurate comparisons
+// TODO: Figure out how to handle projectedColumns expansion
 void expandSignature(ViewMetadata &metadata, std::unordered_map<boss::Symbol, ViewMetadata> &cache,
                      std::unordered_set<boss::Symbol> &seen) {
   for (const auto &viewName : metadata.dependencies) {
@@ -1543,8 +1732,13 @@ std::optional<Expression> findRewriting(const Expression &query, ViewMetadata &q
 
     auto candCost = trueCost(name, true);
 
-    // Skip views that we know won't be admitted to the cache, to avoid materialising them
-    if (!viewCache.count(name) && !inRegistry && !couldWinAdmission(name, candCost))
+    // Skip views that we know won't be admitted to the cache, to avoid materialising them.
+    // Only meaningful under the Benefit policy: the snapshot simulates a benefit-ranked
+    // admission. Under LRU an in-use candidate is MRU and would essentially always win;
+    // under Random admission is unpredictable by construction - both always materialise,
+    // and any wasted builds are charged to the policy.
+    if (evictionPolicy == EvictionPolicy::Benefit && !viewCache.count(name) && !inRegistry &&
+        !couldWinAdmission(name, candCost))
       continue;
 
     if (!bestName ||
